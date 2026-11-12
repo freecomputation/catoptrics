@@ -923,5 +923,204 @@ class TestSurvey(unittest.TestCase):
             self.assertIn("survey stopped", text)
 
 
+# ---------------------------------------------------------------------
+# 0.3.1: --images-only - the survey's live-fold function. The walk,
+# the order and the summary are the survey's own; only the fold
+# changes hands, from capture-then-reconstruct to the watch
+# machinery, and no recording is written. Streams are backed
+# through the survey_live_chunks seam, the same way captures are
+# backed through capture_iq_file.
+# ---------------------------------------------------------------------
+
+def _fake_survey_stream(record):
+    """A survey_live_chunks stand-in: each target's stream is a
+    replay of the very file the capture fake would have written
+    for it, so the live fold drinks the same signal the recorded
+    path folds offline."""
+    def fake(plan, chunk_samples):
+        record.append(plan["target_number"])
+        with tempfile.NamedTemporaryFile(
+                suffix=".cu8", delete=False) as fh:
+            name = fh.name
+        try:
+            _fake_survey_capture([])(plan, Path(name))
+            yield from cat.replay_chunks(Path(name), chunk_samples)
+        finally:
+            Path(name).unlink(missing_ok=True)
+    return fake
+
+
+def _run_survey_live(td, extra=(), holders=()):
+    record = []
+    captures = []
+    with mock.patch.object(cat, "find_tuner_holders",
+                           return_value=list(holders)), \
+            mock.patch.object(cat.shutil, "which",
+                              return_value="/usr/bin/rtl_sdr"), \
+            mock.patch.object(cat, "capture_iq_file",
+                              _fake_survey_capture(captures)), \
+            mock.patch.object(cat, "survey_live_chunks",
+                              _fake_survey_stream(record)):
+        code = cat.main(["survey", "--session", td, "--no-hunt",
+                         "--rate", "11520000", "--seconds", "1",
+                         "--images-only", *extra])
+    return code, record, captures
+
+
+class TestSurveyImagesOnly(unittest.TestCase):
+    def test_images_only_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            code, record, captures = _run_survey_live(td)
+            self.assertEqual(code, cat.EXIT_OK)
+            # The live path streamed both mode targets and never
+            # ran a capture: nothing was recorded, anywhere.
+            self.assertEqual(record, [1, 2])
+            self.assertEqual(captures, [])
+            survey_dir = Path(td) / "survey"
+            self.assertEqual(list(survey_dir.glob("*.cu8")), [])
+            self.assertEqual(list(survey_dir.glob("*.cf32")), [])
+            doc = _survey_doc(td)
+            self.assertTrue(doc["images_only"])
+            by_number = {e["number"]: e for e in doc["targets"]}
+            self.assertEqual(len(by_number), 3)
+            locked = by_number[1]
+            self.assertEqual(locked["mode"], "SIM320x200@60")
+            self.assertEqual(locked["status"], "locked")
+            self.assertEqual(locked["fold_path"], "live")
+            self.assertIsNone(locked["iq"])
+            self.assertGreaterEqual(locked["autocorr_peak"],
+                                    cat.LOCK_FLOOR)
+            carrier = by_number[2]
+            self.assertEqual(carrier["mode"], "1024x768@60")
+            self.assertEqual(carrier["status"], "no_lock")
+            self.assertEqual(carrier["fold_path"], "live")
+            self.assertIsNone(carrier["iq"])
+            self.assertLess(carrier["autocorr_peak"],
+                            cat.LOCK_FLOOR)
+            listed = by_number[3]
+            self.assertEqual(listed["kind"], "unidentified")
+            self.assertEqual(listed["status"], "listed")
+            self.assertIsNone(listed["image"])
+            self.assertNotIn("fold_path", listed)
+            # One image file per mode target, and nothing else
+            # was folded.
+            for entry in (locked, carrier):
+                self.assertTrue(
+                    (survey_dir / entry["image"]).is_file())
+            self.assertEqual(
+                list(survey_dir.glob("target-03-*.png")), [])
+            # The locked live image scores against the pattern it
+            # was synthesized from.
+            mode = cat.MODE_BY_NAME["SIM320x200@60"]
+            _iq, _info, pattern = cat.simulate_iq(mode)
+            image = cat.read_png(survey_dir / locked["image"])
+            ncc = cat.normalized_cross_correlation(
+                pattern * 255.0, image.astype(np.float64))
+            self.assertGreaterEqual(ncc, 0.9)
+            # Both summaries mark the live path and the missing
+            # recordings on each folded target's line.
+            text = (survey_dir / "survey.txt").read_text()
+            self.assertEqual(text.count("- live fold"), 2)
+            self.assertEqual(
+                text.count("(live fold, no recording kept)"), 2)
+            self.assertIn("no raster lock", text)
+            self.assertIn("listed only", text)
+            self.assertEqual(doc["counts"]["locked"], 1)
+            self.assertEqual(doc["counts"]["no_lock"], 1)
+            self.assertEqual(doc["counts"]["listed"], 1)
+            # One target locked, so the contact sheet exists.
+            self.assertEqual(doc["contact_sheet"],
+                             "survey-contact-sheet.png")
+            self.assertTrue(
+                (survey_dir / "survey-contact-sheet.png").is_file())
+            # The session log notes the live path, in the plan
+            # and in each folded target's event.
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            events = [e["event"] for e in entries]
+            self.assertIn("survey_planned", events)
+            self.assertEqual(events.count("survey_target"), 3)
+            self.assertIn("survey_done", events)
+            planned = [e for e in entries
+                       if e["event"] == "survey_planned"][0]
+            self.assertTrue(planned["images_only"])
+            logged = {e["number"]: e for e in entries
+                      if e["event"] == "survey_target"}
+            self.assertEqual(logged[1]["fold_path"], "live")
+            self.assertEqual(logged[2]["fold_path"], "live")
+            self.assertNotIn("fold_path", logged[3])
+
+    def test_images_only_stops_when_tuner_taken_mid_walk(self):
+        holders = [{"pid": 4242, "command": "python3 -m passband run",
+                    "program": "passband"}]
+        scans = [[], [], holders]
+        record = []
+        captures = []
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            with mock.patch.object(
+                    cat, "find_tuner_holders",
+                    side_effect=lambda: scans.pop(0)), \
+                    mock.patch.object(cat.shutil, "which",
+                                      return_value="/usr/bin/rtl_sdr"), \
+                    mock.patch.object(
+                        cat, "capture_iq_file",
+                        _fake_survey_capture(captures)), \
+                    mock.patch.object(
+                        cat, "survey_live_chunks",
+                        _fake_survey_stream(record)):
+                code = cat.main(["survey", "--session", td,
+                                 "--no-hunt", "--rate", "11520000",
+                                 "--seconds", "1", "--images-only"])
+            self.assertEqual(code, cat.EXIT_BUSY)
+            # Only the first target was streamed, its image
+            # survives intact, and nothing was recorded.
+            self.assertEqual(record, [1])
+            self.assertEqual(captures, [])
+            doc = _survey_doc(td)
+            self.assertTrue(doc["stopped_busy"])
+            self.assertEqual(doc["counts"]["locked"], 1)
+            self.assertEqual(len(doc["targets"]), 1)
+            entry = doc["targets"][0]
+            self.assertEqual(entry["status"], "locked")
+            self.assertEqual(entry["fold_path"], "live")
+            survey_dir = Path(td) / "survey"
+            self.assertTrue((survey_dir / entry["image"]).is_file())
+            self.assertEqual(list(survey_dir.glob("*.cu8")), [])
+            text = (survey_dir / "survey.txt").read_text()
+            self.assertIn("live fold", text)
+            self.assertIn("survey stopped", text)
+
+    def test_default_survey_still_records(self):
+        # The regression guard for the flag: with --images-only
+        # absent, the survey is 0.3.0's - recordings written,
+        # summaries in the recorded form, no live-path markers
+        # anywhere.
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            code, record = _run_survey(td)
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertEqual(record, [1, 2])
+            doc = _survey_doc(td)
+            self.assertNotIn("images_only", doc)
+            survey_dir = Path(td) / "survey"
+            for e in doc["targets"]:
+                self.assertNotIn("fold_path", e)
+                if e["kind"] == "mode":
+                    self.assertIsNotNone(e["iq"])
+                    self.assertTrue(e["iq"].endswith(".cu8"))
+                    self.assertTrue(
+                        (survey_dir / e["iq"]).is_file())
+            text = (survey_dir / "survey.txt").read_text()
+            self.assertNotIn("live fold", text)
+            self.assertIn("capture 1.0 s", text)
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            planned = [e for e in entries
+                       if e["event"] == "survey_planned"][0]
+            self.assertNotIn("images_only", planned)
+
+
 if __name__ == "__main__":
     unittest.main()

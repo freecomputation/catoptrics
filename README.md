@@ -139,6 +139,22 @@ list unattended and bring back one image file per device.
   exits 3. Ctrl+C ends the same graceful way, with the summary of
   what completed and exit code 0.
 
+  With `--images-only`, the survey folds each mode target live
+  instead of capturing it first: the target's stream is opened
+  for the same `--seconds` window and folded as it arrives, with
+  the watch machinery - the same incremental folder, sync
+  acquisition and drift re-checks - and only the finished image
+  is kept, under the same name the recorded path would give it.
+  No IQ recording is written, and the target's summary line says
+  so. It is the right choice for a light, quick pass: the survey
+  folder stays small, and a target's image exists the moment its
+  window closes rather than after a second pass over a
+  recording. What it gives up is the evidence: with no recording
+  kept, a borderline result cannot be re-folded with different
+  settings or re-judged later, and a fold that never locks
+  leaves only its blank image and its numbers. The recorded
+  survey remains the default.
+
 Two refusals deserve stating plainly. Pointing `watch` or
 `reconstruct` at an unidentified target - a peak no pixel-clock
 family matched - without an explicit geometry refuses with an
@@ -218,10 +234,12 @@ python3 catoptrics.py watch --source sim.cf32 \
 - `survey` accepts the hunt flags (`--low`, `--high`, `--threshold`,
   `--spectrum`), `--no-hunt` to reuse the saved target list,
   `--seconds` per capture (default 20), `--limit`, `--rate`,
-  `--gain`, and `--confirmed-only`. Its outputs live in
+  `--gain`, `--confirmed-only`, and `--images-only` to fold each
+  target live and keep only its image. Its outputs live in
   `<session>/survey/`: one `.cu8` recording and one `.png` per
-  captured target, `survey.json`, `survey.txt`, and - when at
-  least one target locked - `survey-contact-sheet.png`.
+  captured target - with `--images-only`, one `.png` per target
+  and no recordings - plus `survey.json`, `survey.txt`, and -
+  when at least one target locked - `survey-contact-sheet.png`.
 
 ## Honest limits
 
@@ -278,7 +296,7 @@ python3 catoptrics.py watch --source sim.cf32 \
 
 ## Verification
 
-The test suite (`python3 -m unittest discover -s tests`, 42 tests)
+The test suite (`python3 -m unittest discover -s tests`, 45 tests)
 covers the pattern and codecs, the simulator's ground truth, sync
 estimation landing on the true frame period, reconstruction
 recovering the test pattern, the census grouping two synthetic
@@ -315,7 +333,16 @@ and never captured, `--confirmed-only` skipping the unconfirmed
 target, `--limit` capping the captures, no contact sheet when
 nothing locked, a tuner-busy-at-start refusal, and a
 becomes-busy-mid-survey stop that preserves the first target's
-finished outputs.
+finished outputs. The 0.3.1 tests add the survey's images-only
+function: an end-to-end live-fold walk over the same synthetic
+world producing image files and no recordings - the raster
+target locked and scoring against its source pattern, the
+carrier verdicted no-lock, the unidentified target listed only -
+with both summary lines marking the live path and the absent
+recordings, the contact sheet present, a becomes-busy-mid-survey
+stop preserving the earlier live results, and a regression guard
+that the default survey still writes its recordings exactly as
+0.3.0 did.
 
 The captured 0.2.0 watch proof replays the simulator's emanation as
 a stream (no tuner). At the standard point - SIM320x200@60, 12 dB
@@ -347,7 +374,25 @@ target, both backed by carrier-like noise, ended at peaks of
 0.001 with the no-lock verdict; the unidentified peak was listed
 only. The contact sheet holds the one locked image.
 
+The captured 0.3.1 proof runs the same synthetic world through
+an `--images-only` survey, its streams supplied through the live
+seam with the capture seam stubbed to prove it never runs. The
+simulator target locked at an autocorrelation peak of 0.905 with
+an image SNR of 31.6 dB and scored a normalized
+cross-correlation of 0.989 against its source pattern; the
+640x480 and 1024x768 targets, both backed by carrier-like
+noise, ended at peaks of 0.002 with the no-lock verdict, their
+images written; the unidentified peak was listed only. The
+survey folder holds the three images, both summaries and the
+contact sheet - and no recordings.
+
 ## State
+
+0.3.1 - the survey's live fold. `--images-only` for `survey`:
+each mode target folded live from its stream with the watch
+machinery, only the image kept, no recording written, and the
+summary lines saying so. The recorded survey is unchanged and
+remains the default.
 
 0.3.0 - the survey. One unattended pass over the census: every
 mode target captured and folded into an image file in
