@@ -38,7 +38,8 @@ much of a screen's image actually leaves the room, and in what shape?
 ## How it is used
 
 Hunt, read the list, select a target, then capture and reconstruct
-- or watch the picture form live.
+- or watch the picture form live - or let `survey` walk the whole
+list unattended and bring back one image file per device.
 
 - `hunt` sweeps a band and takes a census. Peaks that belong to one
   source - one pixel-clock harmonic family with a consistent refresh
@@ -105,6 +106,38 @@ Hunt, read the list, select a target, then capture and reconstruct
   receiver is opened, a holder means refusal with exit code 3 and
   the holder named, never a kill or a preemption; a missing
   `rtl_sdr` or numpy is exit code 2.
+- `survey` is the unattended pass: it does what hunt, capture and
+  reconstruct do by hand, in one run. It censuses the band (the
+  same flags as `hunt`, or `--spectrum FILE` to census a recorded
+  sweep, or `--no-hunt` to reuse the session's saved target list),
+  then walks the target list in order. Every target that carries a
+  mode is captured for `--seconds` seconds of raw IQ (default 20)
+  at its strongest frequency and folded into an image file in the
+  survey folder, `<session>/survey/`, named by target number,
+  raster and frequency - `target-09-1280x720-148.358MHz.png` - with
+  the IQ recording it came from kept beside it under the same stem.
+  `--limit N` caps how many targets are captured; targets past the
+  cap are reported as skipped. `--confirmed-only` skips mode
+  targets without second-harmonic confirmation; by default every
+  mode target is surveyed, weak ones included and labeled. A
+  target with no geometry - an unidentified peak - is never
+  folded: it appears in the summary as listed only, with its
+  occupant note where one applies. When the walk ends, the survey
+  writes `survey.json` (machine-readable) and `survey.txt` (the
+  same text it prints) into the survey folder: one line per target
+  with its number, mode or unidentified status, strongest
+  frequency, capture seconds, autocorrelation peak, image SNR, the
+  lock verdict - locked, or no raster lock by the same 0.20 floor -
+  and its image filename. Targets that locked are also gathered
+  into `survey-contact-sheet.png`, a plain grid of the locked
+  images assembled at the array level, with no text drawn on it;
+  the summary carries which target each cell holds, in walk order.
+  The tuner law applies at the start and again before every
+  capture: held at the start, the survey refuses with exit code 3
+  and the holder named; taken mid-survey, the survey stops, keeps
+  everything already finished, prints the partial summary, and
+  exits 3. Ctrl+C ends the same graceful way, with the summary of
+  what completed and exit code 0.
 
 Two refusals deserve stating plainly. Pointing `watch` or
 `reconstruct` at an unidentified target - a peak no pixel-clock
@@ -124,9 +157,11 @@ signals: a strong real carrier with no raster structure in it
 scored 0.039, while genuine locks on the simulator's signal score
 0.59 and up.
 
-Every hunt, capture, reconstruction, and watch is recorded in an
-append-only session log (`session.jsonl` in the session directory)
-with its parameters and its measured quality numbers.
+Every hunt, capture, reconstruction, watch, and survey is recorded
+in an append-only session log (`session.jsonl` in the session
+directory) with its parameters and its measured quality numbers;
+a survey logs its planned walk, one entry per finished target with
+its numbers and verdict, and a closing count.
 
 ## Running it
 
@@ -141,6 +176,7 @@ python3 catoptrics.py hunt --low 40M --high 400M
 python3 catoptrics.py capture --target 2 --seconds 5
 python3 catoptrics.py reconstruct --iq capture.cu8 --target 2
 python3 catoptrics.py watch --target 2
+python3 catoptrics.py survey
 python3 catoptrics.py simulate --out sim.cf32
 python3 catoptrics.py reconstruct --iq sim.cf32 \
     --mode SIM320x200@60 --rate 11520000 --reference sim.pattern.png
@@ -179,6 +215,13 @@ python3 catoptrics.py watch --source sim.cf32 \
   first snapshot is also kept beside the live image as
   `watch-first.png`, so the earliest formed picture survives the
   rewriting.
+- `survey` accepts the hunt flags (`--low`, `--high`, `--threshold`,
+  `--spectrum`), `--no-hunt` to reuse the saved target list,
+  `--seconds` per capture (default 20), `--limit`, `--rate`,
+  `--gain`, and `--confirmed-only`. Its outputs live in
+  `<session>/survey/`: one `.cu8` recording and one `.png` per
+  captured target, `survey.json`, `survey.txt`, and - when at
+  least one target locked - `survey-contact-sheet.png`.
 
 ## Honest limits
 
@@ -217,10 +260,25 @@ python3 catoptrics.py watch --source sim.cf32 \
   end of the same bias, which is why live and offline agree to
   within about 0.03 of correlation on the same stream rather than
   exactly.
+- A survey inherits every limit above and adds its own. It folds
+  only what the census could name: an unidentified peak has no
+  geometry, and no image is invented for it - in a loud
+  environment most of the census is such peaks and strong
+  transmitters wearing a family coincidence, so most of a real
+  survey's lines will be listed-only entries and no-lock verdicts.
+  That is the survey working, not failing: a folder of measured
+  nulls with a few genuine locks is the honest output. The sweep
+  is serial - one tuner, one target at a time, `--seconds` seconds
+  apiece (20 by default) plus fold time - so a long target list
+  takes minutes, not a snapshot's instant. And a locked image at
+  RTL sample rates is coarse: at 2.4 MS/s the receiver sees a
+  small fraction of the pixel slots per frame, so what folds out
+  is the picture's broad structure, gathered over the capture's
+  frames - shapes and bands, not fine detail.
 
 ## Verification
 
-The test suite (`python3 -m unittest discover -s tests`, 36 tests)
+The test suite (`python3 -m unittest discover -s tests`, 42 tests)
 covers the pattern and codecs, the simulator's ground truth, sync
 estimation landing on the true frame period, reconstruction
 recovering the test pattern, the census grouping two synthetic
@@ -246,7 +304,18 @@ paths) while a genuine simulated raster earns none, and a
 synthetic mirror of the first field hunt - strong FM peaks, a
 strong lone 153.5 MHz peak, a NOAA-frequency peak, one true
 1280x800 family - censused with the notes and the mode claim
-reading as they should.
+reading as they should. The 0.3.0 tests add the survey: an
+end-to-end walk over a synthetic world whose confirmed simulator
+target is backed by real raster IQ and whose second mode target
+is backed by carrier-like noise, producing one image file per
+mode target - the raster locked and scoring against its source
+pattern, the carrier carrying the no-lock verdict - with every
+target's line in both summaries, the unidentified target listed
+and never captured, `--confirmed-only` skipping the unconfirmed
+target, `--limit` capping the captures, no contact sheet when
+nothing locked, a tuner-busy-at-start refusal, and a
+becomes-busy-mid-survey stop that preserves the first target's
+finished outputs.
 
 The captured 0.2.0 watch proof replays the simulator's emanation as
 a stream (no tuner). At the standard point - SIM320x200@60, 12 dB
@@ -266,7 +335,26 @@ pattern reconstructs at a correlation of 0.999 to 1.000 with a sync
 peak of 0.916. Hardware verification against a live display is
 pending a free tuner and will be recorded here when it happens.
 
+The captured 0.3.0 survey proof runs the shipped survey over a
+synthetic spectrum holding three mode targets and one unidentified
+peak, with captures supplied through the same seam the tests stub
+(no tuner on the proof machine). The confirmed simulator target,
+backed by real raster IQ, locked at an autocorrelation peak of
+0.953 with an image SNR of 32.6 dB and scored a normalized
+cross-correlation of 0.995 against its source pattern; the
+confirmed 640x480 target and the weak, unconfirmed 1024x768
+target, both backed by carrier-like noise, ended at peaks of
+0.001 with the no-lock verdict; the unidentified peak was listed
+only. The contact sheet holds the one locked image.
+
 ## State
+
+0.3.0 - the survey. One unattended pass over the census: every
+mode target captured and folded into an image file in
+`<session>/survey/`, its IQ kept beside it, unidentified targets
+listed and never folded, a written summary in `survey.txt` and
+`survey.json`, the locked images gathered into a contact sheet,
+and the tuner law enforced at the start and before every capture.
 
 0.2.1 - the field lessons. Spectrum occupant notes on census
 entries, seven more mode families in the table (1024x600, 1280x800,
