@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - exercised only without numpy
     np = None
     HAS_NUMPY = False
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 2
@@ -1461,6 +1461,18 @@ def capture_iq_file(plan, out_path):
     return None
 
 
+def survey_live_chunks(plan, chunk_samples):
+    """The stream an images-only survey target is folded from.
+
+    The live counterpart of the capture_iq_file seam: normal
+    operation streams from rtl_sdr at the planned frequency; a
+    test can substitute a replayed file, the same way the suite
+    backs captures with synthesized IQ, while nothing on this path
+    ever writes a recording - the fold is the only artifact.
+    """
+    return rtl_sdr_chunks(plan, chunk_samples)
+
+
 # ---------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------
@@ -1846,6 +1858,40 @@ def command_watch(args) -> int:
 # would be a lie with a file extension.
 # ---------------------------------------------------------------------
 
+def _survey_fold_live(target, plan, args):
+    """Fold one survey target live, the images-only path: open
+    the target's stream for the survey's window and fold frames
+    as they arrive with the watch machinery - the same LiveFolder,
+    the same sync acquisition, multi-lag refinement and periodic
+    re-checks - then read the finished picture from the folder.
+
+    Returns (image, stats), where stats is the folder's snapshot
+    statistics. If sync is never acquired no frame is folded and
+    the image is the honest blank at the target's raster size:
+    the target still gets its file, carrying the no-lock verdict
+    its numbers earn. Raises OSError when the stream itself
+    cannot be opened or read.
+    """
+    params = target_mode_params(target)
+    folder = LiveFolder(params, args.rate)
+    chunk_samples = max(1024, int(args.rate * 0.25))
+    stream = survey_live_chunks(plan, chunk_samples)
+    sample_cap = int(args.seconds * args.rate)
+    try:
+        for _raw, iq in stream:
+            folder.push(np.abs(iq))
+            if folder.samples_seen >= sample_cap:
+                break
+    finally:
+        stream.close()
+    folder.flush()
+    image, stats = folder.snapshot()
+    if image is None:
+        image = np.zeros((params["height"], params["width"]),
+                         dtype=np.uint8)
+    return image, stats
+
+
 def _survey_stem(target):
     """The file stem a surveyed target's IQ and image share: the
     target number, its visible raster, its strongest frequency."""
@@ -1885,11 +1931,20 @@ def _survey_lines(doc):
         else:
             verdict = "locked" if e["status"] == "locked" \
                 else "no raster lock"
-            line = (f"{head} {e['mode']} {freq} - capture "
-                    f"{e['capture_seconds']:.1f} s, autocorrelation "
-                    f"peak {e['autocorr_peak']:.3f}, image SNR "
-                    f"{e['image_snr_db']:.1f} dB, {verdict}, "
-                    f"{e['image']}")
+            if e.get("fold_path") == "live":
+                line = (f"{head} {e['mode']} {freq} - live fold "
+                        f"{e['capture_seconds']:.1f} s, "
+                        f"autocorrelation peak "
+                        f"{e['autocorr_peak']:.3f}, image SNR "
+                        f"{e['image_snr_db']:.1f} dB, {verdict}, "
+                        f"{e['image']} (live fold, no recording "
+                        f"kept)")
+            else:
+                line = (f"{head} {e['mode']} {freq} - capture "
+                        f"{e['capture_seconds']:.1f} s, autocorrelation "
+                        f"peak {e['autocorr_peak']:.3f}, image SNR "
+                        f"{e['image_snr_db']:.1f} dB, {verdict}, "
+                        f"{e['image']}")
         lines.append(line)
     if doc["contact_sheet"]:
         lines.append(
@@ -1952,13 +2007,17 @@ def command_survey(args) -> int:
 
     # The walk is written down before the tuner is touched, as
     # with capture.
-    session.log("survey_planned",
-                targets=[t["number"] for t in targets],
-                mode_targets=[t["number"] for t in mode_targets],
-                seconds=args.seconds, rate=args.rate,
-                limit=args.limit,
-                confirmed_only=args.confirmed_only,
-                no_hunt=args.no_hunt, spectrum=args.spectrum)
+    planned = {
+        "targets": [t["number"] for t in targets],
+        "mode_targets": [t["number"] for t in mode_targets],
+        "seconds": args.seconds, "rate": args.rate,
+        "limit": args.limit,
+        "confirmed_only": args.confirmed_only,
+        "no_hunt": args.no_hunt, "spectrum": args.spectrum,
+    }
+    if args.images_only:
+        planned["images_only"] = True
+    session.log("survey_planned", **planned)
     survey_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -2018,6 +2077,43 @@ def command_survey(args) -> int:
                                 seconds=args.seconds,
                                 gain=args.gain)
             stem = _survey_stem(t)
+            if args.images_only:
+                # The function, not a reversal: the same walk,
+                # the same order, the same summary - only the
+                # fold is live and nothing is recorded.
+                captures_done += 1
+                image_name = stem + ".png"
+                print(f"survey: target {t['number']} "
+                      f"({t['mode_guess']}), "
+                      f"{fmt_freq(plan['freq_hz'])}, live fold "
+                      f"{args.seconds} s -> {image_name}",
+                      flush=True)
+                try:
+                    image, stats = _survey_fold_live(t, plan, args)
+                except OSError as exc:
+                    entry["status"] = "failed"
+                    entry["reason"] = str(exc)
+                    session.log("survey_stream_failed",
+                                target_number=t["number"],
+                                error=str(exc))
+                    finish(entry)
+                    continue
+                write_png(survey_dir / image_name, image)
+                entry["capture_seconds"] = float(args.seconds)
+                entry["autocorr_peak"] = stats["autocorr_peak"]
+                entry["image_snr_db"] = stats["image_snr_db"]
+                entry["frames_averaged"] = stats["frames_folded"]
+                entry["image"] = image_name
+                entry["fold_path"] = "live"
+                if lock_verdict(stats["autocorr_peak"]) is None:
+                    entry["status"] = "locked"
+                    entry["verdict"] = "locked"
+                    locked_images.append(image)
+                else:
+                    entry["status"] = "no_lock"
+                    entry["verdict"] = "no_lock"
+                finish(entry)
+                continue
             iq_path = survey_dir / (stem + ".cu8")
             print(f"survey: target {t['number']} "
                   f"({t['mode_guess']}), "
@@ -2083,6 +2179,8 @@ def command_survey(args) -> int:
         "counts": counts, "contact_sheet": contact_sheet,
         "targets": results,
     }
+    if args.images_only:
+        doc["images_only"] = True
     with open(survey_dir / "survey.json", "w",
               encoding="utf-8") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
@@ -2335,6 +2433,11 @@ def main(argv=None) -> int:
                              "second-harmonic confirmation (default "
                              "surveys every mode target, weak ones "
                              "included and labeled)")
+    survey.add_argument("--images-only", action="store_true",
+                        help="fold each target live from its "
+                             "stream and keep only the image - no "
+                             "IQ recording is written (default "
+                             "captures and keeps the recording)")
     survey.set_defaults(func=command_survey)
 
     recon = sub.add_parser("reconstruct", help="fold IQ into an image")
