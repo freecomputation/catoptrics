@@ -291,5 +291,210 @@ class TestCaptureAndHuntCommands(unittest.TestCase):
             self.assertIn("hunt", [e["event"] for e in entries])
 
 
+# ---------------------------------------------------------------------
+# Live watch: the incremental folder
+# ---------------------------------------------------------------------
+
+SIM_PARAMS = {"width": 320, "height": 200, "htotal": 400,
+              "vtotal": 240, "refresh": 60.0,
+              "pixel_clock": 5_760_000}
+
+
+def drive_folder(folder, iq, rate):
+    """Push an IQ array's envelope in one-frame chunks, then flush."""
+    env = np.abs(iq)
+    chunk = int(rate / 60)
+    for i in range(0, len(env), chunk):
+        folder.push(env[i:i + chunk])
+    folder.flush()
+    return folder
+
+
+class TestWatchFolder(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mode = cat.MODE_BY_NAME["SIM320x200@60"]
+        cls.iq, cls.info, cls.pattern = cat.simulate_iq(cls.mode)
+
+    def test_live_fold_converges_on_offline_bench(self):
+        folder = drive_folder(
+            cat.LiveFolder(SIM_PARAMS, self.info["rate"]),
+            self.iq, self.info["rate"])
+        image, stats = folder.snapshot()
+        offline, report = cat.reconstruct_iq(
+            self.iq, self.info["rate"], SIM_PARAMS,
+            reference=self.pattern * 255.0)
+        agree = cat.normalized_cross_correlation(
+            offline.astype(np.float64), image.astype(np.float64))
+        self.assertGreaterEqual(agree, 0.95)
+        self.assertGreaterEqual(
+            cat.normalized_cross_correlation(
+                self.pattern * 255.0, image.astype(np.float64)),
+            0.95)
+        self.assertGreaterEqual(stats["frames_folded"], 15)
+
+    def test_snapshots_improve_within_stated_tolerance(self):
+        # Stated tolerance: on this 0 dB stream the final snapshot
+        # may sit up to 0.05 of correlation below the early one.
+        # Noise averaging dominates the early frames; over long
+        # folds the period estimate's small residual bias
+        # integrates sample by sample (measured and stated in the
+        # README), so a slow decline after the peak is the honest
+        # behavior. What must never happen is a collapse - the
+        # final image stays at proof standard.
+        iq, info, pattern = cat.simulate_iq(
+            self.mode, seconds=1.0, snr_db=0.0)
+        folder = cat.LiveFolder(SIM_PARAMS, info["rate"])
+        env = np.abs(iq)
+        chunk = int(info["rate"] / 60)
+        early = None
+        for i in range(0, len(env), chunk):
+            folder.push(env[i:i + chunk])
+            if early is None and folder.frames_folded >= 5:
+                img, _ = folder.snapshot()
+                early = cat.normalized_cross_correlation(
+                    pattern * 255.0, img.astype(np.float64))
+        folder.flush()
+        image, _ = folder.snapshot()
+        final = cat.normalized_cross_correlation(
+            pattern * 255.0, image.astype(np.float64))
+        self.assertIsNotNone(early)
+        self.assertGreaterEqual(final, 0.94)
+        self.assertGreaterEqual(final, early - 0.05)
+
+    def test_stable_tracking_across_planted_clock_offset(self):
+        # The simulator's clock runs +37 ppm fast. Over 36 frames
+        # the folder must hold sync without a single re-lock and
+        # land on the true period.
+        iq, info, pattern = cat.simulate_iq(
+            self.mode, seconds=0.6, snr_db=12.0)
+        folder = drive_folder(
+            cat.LiveFolder(SIM_PARAMS, info["rate"]), iq,
+            info["rate"])
+        true_period = (self.mode["htotal"] * self.mode["vtotal"]
+                       * info["rate"] / info["pixel_clock_true"])
+        self.assertEqual(folder.relocks, 0)
+        self.assertGreater(len(folder.period_checks), 0)
+        self.assertLess(
+            abs(folder.period - true_period) / true_period, 1e-4)
+
+    def test_relock_after_clock_jump(self):
+        # The clock steps from +37 ppm to -800 ppm mid-stream: a
+        # re-lock must be adopted, the tracked period must land on
+        # the new clock, and the picture must survive.
+        iq_a, info, pattern = cat.simulate_iq(
+            self.mode, seconds=0.35, snr_db=12.0)
+        iq_b, _, _ = cat.simulate_iq(
+            self.mode, seconds=0.45, snr_db=12.0,
+            clock_ppm=-800.0, seed=777)
+        folder = cat.LiveFolder(SIM_PARAMS, info["rate"],
+                                relock_every=15)
+        env = np.abs(np.concatenate([iq_a, iq_b]))
+        chunk = int(info["rate"] / 60)
+        for i in range(0, len(env), chunk):
+            folder.push(env[i:i + chunk])
+        folder.flush()
+        self.assertGreaterEqual(folder.relocks, 1)
+        self.assertTrue(
+            any(c["adopted"] for c in folder.period_checks))
+        true_b = (self.mode["htotal"] * self.mode["vtotal"]
+                  * info["rate"]
+                  / (self.mode["pixel_clock"] * (1 - 800e-6)))
+        self.assertLess(abs(folder.period - true_b) / true_b, 1e-4)
+        image, _ = folder.snapshot()
+        self.assertGreaterEqual(
+            cat.normalized_cross_correlation(
+                pattern * 255.0, image.astype(np.float64)), 0.95)
+
+
+class TestWatchCommand(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mode = cat.MODE_BY_NAME["SIM320x200@60"]
+        cls.iq, cls.info, cls.pattern = cat.simulate_iq(cls.mode)
+
+    def _write_replay(self, td):
+        src = Path(td) / "emanation.cf32"
+        cat.save_iq(src, self.iq, "cf32")
+        return src
+
+    def test_watch_replay_records_and_summarizes(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._write_replay(td)
+            session_dir = Path(td) / "session"
+            code = cat.main(["watch", "--session", str(session_dir),
+                             "--source", str(src),
+                             "--mode", "SIM320x200@60",
+                             "--rate", str(self.info["rate"]),
+                             "--every-frames", "6"])
+            self.assertEqual(code, cat.EXIT_OK)
+            entries = [json.loads(line) for line in
+                       open(session_dir / "session.jsonl")]
+            events = [e["event"] for e in entries]
+            self.assertIn("watch_planned", events)
+            self.assertIn("watch_locked", events)
+            summary = entries[-1]
+            self.assertEqual(summary["event"], "watch")
+            self.assertGreaterEqual(summary["frames_folded"], 15)
+            # Recording fidelity: the recorded stream is the
+            # replayed stream byte for byte, and it re-folds
+            # offline to the same picture.
+            recorded = Path(summary["record"])
+            self.assertEqual(recorded.read_bytes(), src.read_bytes())
+            iq_back = cat.load_iq(recorded)
+            image, report = cat.reconstruct_iq(
+                iq_back, self.info["rate"], SIM_PARAMS,
+                reference=self.pattern * 255.0)
+            self.assertGreaterEqual(report["reference_ncc"], 0.95)
+            self.assertTrue(Path(summary["image"]).is_file())
+            self.assertTrue(Path(summary["first_image"]).is_file())
+
+    def test_watch_no_record_writes_no_iq(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._write_replay(td)
+            session_dir = Path(td) / "session"
+            code = cat.main(["watch", "--session", str(session_dir),
+                             "--source", str(src),
+                             "--mode", "SIM320x200@60",
+                             "--rate", str(self.info["rate"]),
+                             "--no-record"])
+            self.assertEqual(code, cat.EXIT_OK)
+            entries = [json.loads(line) for line in
+                       open(session_dir / "session.jsonl")]
+            summary = entries[-1]
+            self.assertEqual(summary["event"], "watch")
+            self.assertIsNone(summary["record"])
+            self.assertEqual(
+                list(session_dir.glob("watch-*.cf32")), [])
+
+    def test_watch_refuses_when_tuner_held(self):
+        holders = [{"pid": 4242, "command": "python3 -m passband run",
+                    "program": "passband"}]
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(cat, "find_tuner_holders",
+                                   return_value=holders):
+                code = cat.main(["watch", "--session", td,
+                                 "--freq", "121.5M",
+                                 "--mode", "SIM320x200@60"])
+            self.assertEqual(code, cat.EXIT_BUSY)
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            events = [e["event"] for e in entries]
+            self.assertIn("watch_planned", events)
+            self.assertIn("refused_busy", events)
+            self.assertEqual(list(Path(td).glob("watch*.png")), [])
+
+    def test_watch_unavailable_without_rtl_sdr(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(cat, "find_tuner_holders",
+                                   return_value=[]), \
+                    mock.patch.object(cat.shutil, "which",
+                                      return_value=None):
+                code = cat.main(["watch", "--session", td,
+                                 "--freq", "121.5M",
+                                 "--mode", "SIM320x200@60"])
+            self.assertEqual(code, cat.EXIT_UNAVAILABLE)
+
+
 if __name__ == "__main__":
     unittest.main()

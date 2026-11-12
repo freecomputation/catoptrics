@@ -12,6 +12,9 @@ The workflow is a census and a selection:
     hunt        sweep a band, group peaks into emanation sources,
                 and print a numbered target list (targets.json)
     capture     record raw IQ, for a selected target or a frequency
+    watch       the live bench: fold frames from a stream as they
+                arrive, writing a picture that sharpens while you
+                look at it, and recording the raw IQ as it goes
     reconstruct fold a capture back into a raster image, with a
                 written report of sync quality and image SNR
     simulate    synthesize a raster emanation from a built-in test
@@ -32,6 +35,7 @@ Exit codes: 0 ok, 2 unavailable or usage problem, 3 tuner busy.
 Usage:
     python3 catoptrics.py hunt --low 40M --high 400M
     python3 catoptrics.py capture --target 2 --seconds 5
+    python3 catoptrics.py watch --target 2
     python3 catoptrics.py reconstruct --iq capture.cu8 --target 2
     python3 catoptrics.py simulate --out sim.iq
 """
@@ -57,7 +61,7 @@ except ImportError:  # pragma: no cover - exercised only without numpy
     np = None
     HAS_NUMPY = False
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 2
@@ -704,14 +708,9 @@ def simulate_iq(mode, seconds=0.3, rate=None, snr_db=12.0,
 # raster. Every parameter searched is reported by the caller.
 # ---------------------------------------------------------------------
 
-def estimate_frame_period(envelope, rate, refresh_nominal,
-                          search_frac=0.03):
-    """Autocorrelation of the envelope around the nominal frame lag.
-
-    Returns (period_samples, peak_strength): the refined period as a
-    float, and the autocorrelation peak normalized so that a perfect
-    periodic signal scores near 1.
-    """
+def _period_autocorr(envelope, rate, refresh_nominal):
+    """The envelope's autocorrelation, decimated as the period
+    estimator decimates, as (ac, decim)."""
     nominal = rate / refresh_nominal
     decim = max(1, int(nominal // 150_000))
     if decim > 1:
@@ -724,6 +723,20 @@ def estimate_frame_period(envelope, rate, refresh_nominal,
     nfft = 1 << (2 * n - 1).bit_length()
     spectrum = np.fft.rfft(env, nfft)
     ac = np.fft.irfft(spectrum * np.conj(spectrum), nfft)[:n]
+    return ac, decim
+
+
+def estimate_frame_period(envelope, rate, refresh_nominal,
+                          search_frac=0.03):
+    """Autocorrelation of the envelope around the nominal frame lag.
+
+    Returns (period_samples, peak_strength): the refined period as a
+    float, and the autocorrelation peak normalized so that a perfect
+    periodic signal scores near 1.
+    """
+    nominal = rate / refresh_nominal
+    ac, decim = _period_autocorr(envelope, rate, refresh_nominal)
+    n = len(ac)
     if ac[0] <= 0:
         return nominal, 0.0
     nom_d = nominal / decim
@@ -743,6 +756,51 @@ def estimate_frame_period(envelope, rate, refresh_nominal,
         delta = 0.0
     period = (k + delta) * decim
     return float(period), strength
+
+
+def refine_period_multilag(envelope, rate, refresh_nominal, period0,
+                           max_mult=6):
+    """Refine a frame-period estimate against the autocorrelation
+    peaks at several frame multiples.
+
+    The peak at m frames sits at m * period, so its position error
+    divided by m is a period estimate with m times less
+    interpolation error; the single-lag estimate carries a small
+    systematic bias (measured at about +0.25 ppm on the simulator's
+    signal) that smears long folds sample by sample. Peaks are
+    weighted by height and by the overlap supporting them, and a
+    peak found at the edge of its narrow search window is
+    distrusted and skipped. Returns period0 unchanged when no
+    usable peak is found.
+    """
+    ac, decim = _period_autocorr(envelope, rate, refresh_nominal)
+    if ac[0] <= 0:
+        return period0
+    n = len(ac)
+    p0d = period0 / decim
+    estimates, weights = [], []
+    for m in range(1, max_mult + 1):
+        center = m * p0d
+        if center > n - 2:
+            break
+        halfwin = max(2.0, 0.0003 * center)
+        lo = max(1, int(center - halfwin))
+        hi = min(n - 1, int(center + halfwin) + 1)
+        if hi - lo < 3:
+            continue
+        k = int(np.argmax(ac[lo:hi])) + lo
+        if k == lo or k == hi - 1 or ac[k] <= 0:
+            continue
+        a, b, c = ac[k - 1], ac[k], ac[k + 1]
+        denom = a - 2.0 * b + c
+        delta = 0.5 * (a - c) / denom if denom != 0 else 0.0
+        estimates.append((k + delta) / m)
+        weights.append(float(ac[k]) * (n - k))
+    if not estimates:
+        return period0
+    w = np.asarray(weights)
+    e = np.asarray(estimates)
+    return float((w * e).sum() / w.sum()) * decim
 
 
 def _fold_slots(envelope, period, phase, samples_per_slot, slot_count,
@@ -849,6 +907,7 @@ def reconstruct_iq(iq, rate, mode_params, reference=None):
     refresh = mode_params["refresh"]
     envelope = np.abs(iq)
     period, ac_strength = estimate_frame_period(envelope, rate, refresh)
+    period = refine_period_multilag(envelope, rate, refresh, period)
     slot_count = htotal * vtotal
     samples_per_slot = period / slot_count
     phase, phase_score = _phase_search(
@@ -888,6 +947,284 @@ def reconstruct_iq(iq, rate, mode_params, reference=None):
         report["reference_ncc"] = normalized_cross_correlation(
             reference, image.astype(np.float64))
     return image, report
+
+
+# ---------------------------------------------------------------------
+# The live bench. watch folds frames as the signal arrives instead
+# of waiting for a finished capture. Sync is acquired from the
+# opening samples with the same estimator the offline bench uses,
+# frames are accumulated with the same slot geometry, and the
+# period estimate is re-checked against the recent signal on a
+# cadence, so a drifting clock is tracked - corrections and
+# re-locks are reported, never hidden. A frame here is the offline
+# bench's frame: period from estimate_frame_period, phase from
+# _phase_search, slot centers at (k + 0.5) * period / slot_count.
+# ---------------------------------------------------------------------
+
+class LiveFolder:
+    """Incremental frame folder over a stream of envelope samples.
+
+    Feed envelope chunks with push(); read the current picture with
+    snapshot(). Frames already folded stay folded - a period
+    adopted at a re-lock steers the frames that come after it, it
+    does not rewrite the average that came before.
+    """
+
+    def __init__(self, params, rate, sync_frames=3.2, relock_every=30,
+                 relock_tol=1e-4):
+        self.width = params["width"]
+        self.height = params["height"]
+        self.htotal = params["htotal"]
+        self.vtotal = params["vtotal"]
+        self.refresh = params["refresh"]
+        self.rate = rate
+        self.slot_count = self.htotal * self.vtotal
+        self.nominal_period = rate / self.refresh
+        self.sync_min = int(sync_frames * self.nominal_period)
+        self.relock_every = relock_every
+        self.relock_tol = relock_tol
+        # Stream state. buf holds every unconsumed sample, from
+        # absolute index buf_start up to samples_seen.
+        self.samples_seen = 0
+        self.buf = np.zeros(0, dtype=np.float64)
+        self.buf_start = 0
+        # A short recent history, kept for the drift re-checks.
+        self.ring = np.zeros(0, dtype=np.float64)
+        self.ring_cap = int(7 * self.nominal_period) + 4096
+        # Sync state.
+        self.locked = False
+        self.period = None
+        self.sps = None
+        self.next_start = 0.0   # absolute index of the next frame
+        self.ac_strength = 0.0
+        self.period_checks = []  # every re-check, as measured
+        self.relocks = 0
+        self.corrections = 0
+        self.frames_at_last_check = 0
+        # Folded moments: per-slot sum and sum of squares.
+        self.sum_slots = np.zeros(self.slot_count, dtype=np.float64)
+        self.sumsq_slots = np.zeros(self.slot_count, dtype=np.float64)
+        self.frames_folded = 0
+
+    # -- intake ----------------------------------------------------
+
+    def push(self, envelope_chunk):
+        chunk = np.asarray(envelope_chunk, dtype=np.float64)
+        if chunk.size == 0:
+            return
+        self.samples_seen += int(chunk.size)
+        self.buf = np.concatenate([self.buf, chunk]) \
+            if self.buf.size else chunk.copy()
+        self.ring = np.concatenate([self.ring, chunk]) \
+            if self.ring.size else chunk.copy()
+        if len(self.ring) > self.ring_cap:
+            self.ring = self.ring[-self.ring_cap:]
+        if not self.locked:
+            if len(self.buf) >= self.sync_min:
+                self._acquire()
+            return
+        self._fold_available()
+        self._maybe_relock()
+
+    def flush(self):
+        """End of stream: acquire sync with what arrived, if it is
+        enough, and fold whatever whole frames remain."""
+        if not self.locked and len(self.buf) >= \
+                int(2.5 * self.nominal_period):
+            self._acquire()
+        if self.locked:
+            self._fold_available()
+
+    # -- sync --------------------------------------------------------
+
+    def _acquire(self):
+        period, strength = estimate_frame_period(
+            self.buf, self.rate, self.refresh)
+        period = refine_period_multilag(
+            self.buf, self.rate, self.refresh, period)
+        sps = period / self.slot_count
+        phase, _score = _phase_search(
+            self.buf, period, sps, self.slot_count,
+            self.htotal, self.width, self.height)
+        self.period = float(period)
+        self.sps = float(sps)
+        self.ac_strength = float(strength)
+        self.next_start = float(phase)
+        self.locked = True
+        self.frames_at_last_check = 0
+        self._fold_available()
+
+    def _maybe_relock(self):
+        if self.frames_folded - self.frames_at_last_check \
+                < self.relock_every:
+            return
+        if len(self.ring) < int(3 * self.nominal_period):
+            return
+        self.frames_at_last_check = self.frames_folded
+        raw_period, strength = estimate_frame_period(
+            self.ring, self.rate, self.refresh)
+        period = refine_period_multilag(
+            self.ring, self.rate, self.refresh, raw_period)
+        check = {"at_frame": self.frames_folded,
+                 "period_samples": float(period),
+                 "period_delta_ppm":
+                     (period - self.period) / self.period * 1e6,
+                 "autocorr_peak": float(strength),
+                 "adopted": False, "corrected": False}
+        self.period_checks.append(check)
+        if strength < 0.1:
+            return  # too weak to trust; keep the period we have
+        delta = abs(period - self.period) / self.period
+        if delta <= 5e-7:
+            return  # the clock agrees with the tracked period
+        if delta <= self.relock_tol:
+            # A correction, not a re-lock: the frame grid stands,
+            # only the spacing of the frames that follow changes.
+            self.period = float(period)
+            self.sps = period / self.slot_count
+            self.ac_strength = float(strength)
+            check["corrected"] = True
+            self.corrections += 1
+            return
+        # Adopt: re-find the phase inside the ring, then place the
+        # next frame start on the new grid, at or after the old one,
+        # so no sample is folded twice and less than one frame of
+        # signal is ever skipped.
+        sps = period / self.slot_count
+        phase, _score = _phase_search(
+            self.ring, period, sps, self.slot_count,
+            self.htotal, self.width, self.height)
+        ring_start = self.samples_seen - len(self.ring)
+        first = ring_start + phase
+        k = math.ceil((self.next_start - first) / period - 1e-9)
+        self.period = float(period)
+        self.sps = float(sps)
+        self.next_start = float(first + k * period)
+        self.ac_strength = float(strength)
+        check["adopted"] = True
+        self.relocks += 1
+
+    # -- folding -----------------------------------------------------
+
+    def _fold_available(self):
+        while self.period is not None:
+            frames_avail = int((self.samples_seen - self.next_start)
+                               // self.period)
+            if frames_avail < 1:
+                return
+            k = min(frames_avail, 16)
+            rel_start = self.next_start - self.buf_start
+            slot_offsets = (np.arange(self.slot_count) + 0.5) \
+                * self.sps
+            starts = rel_start + np.arange(k) * self.period
+            positions = (starts[:, None]
+                         + slot_offsets[None, :]).ravel()
+            xp = np.arange(len(self.buf))
+            vals = np.interp(positions, xp, self.buf)
+            vals = vals.reshape(k, self.slot_count)
+            self.sum_slots += vals.sum(axis=0)
+            self.sumsq_slots += (vals * vals).sum(axis=0)
+            self.frames_folded += k
+            self.next_start += k * self.period
+            new_start = int(self.next_start)
+            if new_start > self.buf_start:
+                drop = min(new_start - self.buf_start, len(self.buf))
+                self.buf = self.buf[drop:]
+                self.buf_start += drop
+
+    # -- the picture so far ------------------------------------------
+
+    def snapshot(self):
+        """(image, stats) for the frames folded so far, or
+        (None, stats) before the first frame lands. The image SNR
+        is the offline bench's computation on the running moments:
+        per-slot variance across frames, divided by the frame
+        count, is the noise left in the average."""
+        stats = {
+            "locked": self.locked,
+            "frames_folded": self.frames_folded,
+            "samples_seen": self.samples_seen,
+            "frame_period_samples": self.period,
+            "frame_period_error_ppm":
+                (self.period - self.nominal_period)
+                / self.nominal_period * 1e6 if self.period else None,
+            "autocorr_peak": self.ac_strength,
+            "relocks": self.relocks,
+            "corrections": self.corrections,
+            "period_checks": len(self.period_checks),
+            "image_snr_db": 0.0,
+        }
+        if self.frames_folded < 1:
+            return None, stats
+        mean = self.sum_slots / self.frames_folded
+        var = np.maximum(
+            self.sumsq_slots / self.frames_folded - mean * mean, 0.0)
+        raster = mean.reshape(self.vtotal, self.htotal)
+        image = auto_contrast(raster[:self.height, :self.width])
+        noise_var = float(np.mean(var)) / self.frames_folded
+        signal_var = float(np.var(mean))
+        signal_only = max(signal_var - noise_var, 0.0)
+        if noise_var > 0 and signal_only > 0:
+            stats["image_snr_db"] = 10.0 * math.log10(
+                signal_only / noise_var)
+        return image, stats
+
+
+# ---------------------------------------------------------------------
+# Stream sources. A source yields (raw_bytes, iq) blocks: the raw
+# bytes exactly as they arrived, so watch can record the stream
+# byte-for-byte while it folds, and the decoded IQ with load_iq's
+# scaling. Two sources: a file replayed as a stream, and a live
+# rtl_sdr process writing unsigned 8-bit IQ to its stdout.
+# ---------------------------------------------------------------------
+
+def _decode_block(raw, fmt):
+    if fmt == "cf32":
+        arr = np.frombuffer(raw, dtype=np.float32)
+        arr = arr[: arr.size // 2 * 2]
+        return arr[0::2].astype(np.float64) \
+            + 1j * arr[1::2].astype(np.float64)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    arr = arr[: arr.size // 2 * 2]
+    return (arr[0::2].astype(np.float64) - 127.5) / 127.4 \
+        + 1j * ((arr[1::2].astype(np.float64) - 127.5) / 127.4)
+
+
+def replay_chunks(path, chunk_samples):
+    """Replay an IQ file (.cu8 or .cf32) as a stream of blocks."""
+    path = Path(path)
+    fmt = "cf32" if path.suffix.lower() in (".cf32", ".iq") else "cu8"
+    bytes_per_sample = 8 if fmt == "cf32" else 2
+    with open(path, "rb") as fh:
+        while True:
+            raw = fh.read(chunk_samples * bytes_per_sample)
+            if not raw:
+                return
+            yield raw, _decode_block(raw, fmt)
+
+
+def rtl_sdr_chunks(plan, chunk_samples):
+    """Stream from a live rtl_sdr process. The generator owns the
+    process: closing the generator terminates it."""
+    cmd = ["rtl_sdr", "-f", str(plan["freq_hz"]), "-s",
+           str(plan["rate"])]
+    if plan.get("gain") is not None:
+        cmd += ["-g", str(plan["gain"])]
+    cmd += ["-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            raw = proc.stdout.read(chunk_samples * 2)
+            if not raw:
+                return
+            yield raw, _decode_block(raw, "cu8")
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 # ---------------------------------------------------------------------
@@ -1092,6 +1429,221 @@ def command_capture(args) -> int:
     return EXIT_OK
 
 
+def command_watch(args) -> int:
+    if not HAS_NUMPY:
+        print("watch unavailable: numpy is not installed",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    session = Session(args.session)
+    target, err = _resolve_target(args, session)
+    if err is not None:
+        return err
+    source_path = Path(args.source) if args.source else None
+    if source_path is None and target is None and args.freq is None:
+        print("watch needs a target (--target N), a frequency "
+              "(--freq), or a replay file (--source); run hunt first",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    params = _resolve_mode_params(args, target)
+    if "width" not in params or "height" not in params:
+        print("watch needs a mode: --target N, --mode NAME, or "
+              "--width and --height", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    plan = {
+        "freq_hz": int(target["strongest_freq_hz"]) if target
+        else (parse_freq(args.freq) if args.freq else None),
+        "rate": int(args.rate),
+        "gain": args.gain,
+        "target_number": target["number"] if target else None,
+        "target_mode": target["mode_guess"] if target else None,
+        "source": str(source_path) if source_path else "rtl_sdr",
+        "mode": f"{params['width']}x{params['height']}",
+        "record_enabled": not args.no_record,
+    }
+    # The plan is written down before the tuner is touched, as with
+    # capture.
+    session.log("watch_planned", **plan)
+    chunk_samples = max(1024, int(args.rate * args.chunk_seconds))
+    if source_path is not None:
+        if not source_path.is_file():
+            print(f"no such IQ file: {source_path}",
+                  file=sys.stderr)
+            session.log("watch_unavailable",
+                        reason="source missing", **plan)
+            return EXIT_UNAVAILABLE
+        stream = replay_chunks(source_path, chunk_samples)
+        record_ext = source_path.suffix.lower() \
+            if source_path.suffix.lower() in (".cu8", ".cf32") \
+            else ".cf32"
+    else:
+        holders = refuse_if_busy(session, "watch")
+        if holders:
+            print_busy(holders)
+            return EXIT_BUSY
+        if shutil.which("rtl_sdr") is None:
+            print("watch unavailable: rtl_sdr not found",
+                  file=sys.stderr)
+            session.log("watch_unavailable",
+                        reason="rtl_sdr missing", **plan)
+            return EXIT_UNAVAILABLE
+        stream = rtl_sdr_chunks(plan, chunk_samples)
+        record_ext = ".cu8"
+
+    reference = None
+    if args.reference:
+        reference = read_png(args.reference).astype(np.float64)
+    out = Path(args.out) if args.out else session.root / "watch.png"
+    first_out = out.with_name(out.stem + "-first.png")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    record_path = None
+    if not args.no_record:
+        record_path = Path(args.record_out) if args.record_out \
+            else session.root / f"watch-{stamp}{record_ext}"
+    folder = LiveFolder(params, args.rate)
+    print(f"watch: {plan['mode']}, rate {args.rate} samples/s, "
+          + (f"replaying {source_path}" if source_path else
+             f"{fmt_freq(plan['freq_hz'])}"
+             + (f", target {plan['target_number']} "
+                f"({plan['target_mode']})" if target else ""))
+          + f" -> {out}")
+    if record_path is not None:
+        print(f"  recording raw stream to {record_path}")
+
+    sink = None
+    started = time.monotonic()
+    sample_cap = int(args.seconds * args.rate) \
+        if args.seconds else None
+    last_write_wall = 0.0
+    last_write_frames = 0
+    wrote_first = False
+    announced_lock = False
+
+    def write_snapshot(final=False):
+        nonlocal last_write_wall, last_write_frames, wrote_first
+        image, stats = folder.snapshot()
+        if image is None:
+            return stats
+        write_png(out, image)
+        if not wrote_first:
+            write_png(first_out, image)
+            wrote_first = True
+        line = (f"  {stats['frames_folded']} frames folded, "
+                f"image SNR {stats['image_snr_db']:.1f} dB")
+        if reference is not None:
+            ncc = normalized_cross_correlation(
+                reference, image.astype(np.float64))
+            line += f", correlation {ncc:.3f}"
+            stats["reference_ncc"] = ncc
+        line += f" -> {out}" if final else ""
+        print(line, flush=True)
+        last_write_wall = time.monotonic()
+        last_write_frames = stats["frames_folded"]
+        return stats
+
+    stats = folder.snapshot()[1]
+    try:
+        while True:
+            try:
+                raw, iq = next(stream)
+            except StopIteration:
+                break
+            if sink is None and record_path is not None:
+                sink = open(record_path, "wb")
+            if sink is not None:
+                sink.write(raw)
+            relocks_before = folder.relocks
+            corrections_before = folder.corrections
+            folder.push(np.abs(iq))
+            if folder.locked and not announced_lock:
+                announced_lock = True
+                session.log(
+                    "watch_locked",
+                    frame_period_samples=folder.period,
+                    frame_period_error_ppm=
+                    (folder.period - folder.nominal_period)
+                    / folder.nominal_period * 1e6,
+                    autocorr_peak=folder.ac_strength)
+                print(f"  sync locked: period {folder.period:.1f} "
+                      f"samples ({(folder.period - folder.nominal_period) / folder.nominal_period * 1e6:+.1f} "
+                      f"ppm from nominal), autocorrelation peak "
+                      f"{folder.ac_strength:.3f}", flush=True)
+            if folder.relocks > relocks_before:
+                check = folder.period_checks[-1]
+                session.log("watch_relock", **check)
+                print(f"  sync re-locked at frame "
+                      f"{check['at_frame']}: period "
+                      f"{folder.period:.1f} samples "
+                      f"({check['period_delta_ppm']:+.1f} ppm "
+                      f"correction), autocorrelation peak "
+                      f"{check['autocorr_peak']:.3f}", flush=True)
+            elif folder.corrections > corrections_before:
+                check = folder.period_checks[-1]
+                session.log("watch_correction", **check)
+                print(f"  sync corrected at frame "
+                      f"{check['at_frame']}: period "
+                      f"{folder.period:.2f} samples "
+                      f"({check['period_delta_ppm']:+.2f} ppm)",
+                      flush=True)
+            now = time.monotonic()
+            if folder.frames_folded > last_write_frames and (
+                    folder.frames_folded - last_write_frames
+                    >= args.every_frames
+                    or now - last_write_wall >= args.interval):
+                stats = write_snapshot()
+            if sample_cap is not None \
+                    and folder.samples_seen >= sample_cap:
+                break
+    except KeyboardInterrupt:
+        print("\nwatch interrupted", flush=True)
+    finally:
+        stream.close()
+        if sink is not None:
+            sink.close()
+    folder.flush()
+    stats = write_snapshot(final=True)
+    wall = time.monotonic() - started
+    record_bytes = record_path.stat().st_size \
+        if record_path is not None and record_path.is_file() else 0
+    summary = {
+        "frames_folded": stats["frames_folded"],
+        "samples": stats["samples_seen"],
+        "signal_seconds": stats["samples_seen"] / args.rate,
+        "wall_seconds": wall,
+        "frame_period_samples": stats["frame_period_samples"],
+        "frame_period_error_ppm": stats["frame_period_error_ppm"],
+        "autocorr_peak": stats["autocorr_peak"],
+        "relocks": stats["relocks"],
+        "corrections": stats["corrections"],
+        "period_checks": stats["period_checks"],
+        "image_snr_db": stats["image_snr_db"],
+        "image": str(out),
+        "first_image": str(first_out) if wrote_first else None,
+        "record": str(record_path) if record_path else None,
+        "record_bytes": record_bytes,
+    }
+    if "reference_ncc" in stats:
+        summary["reference_ncc"] = stats["reference_ncc"]
+    session.log("watch", **plan, **summary)
+    if stats["frames_folded"] < 1:
+        print("watch: no sync acquired - no frame was folded, and "
+              "no image formed")
+    print(f"watch summary: {summary['frames_folded']} frames folded, "
+          f"{summary['signal_seconds']:.1f} s of signal in "
+          f"{wall:.1f} s")
+    if summary["frame_period_samples"]:
+        print(f"  period {summary['frame_period_samples']:.1f} "
+              f"samples ({summary['frame_period_error_ppm']:+.1f} "
+              f"ppm), sync peak {summary['autocorr_peak']:.3f}, "
+              f"{summary['relocks']} re-locks and "
+              f"{summary['corrections']} corrections over "
+              f"{summary['period_checks']} checks")
+    print(f"  image SNR {summary['image_snr_db']:.1f} dB")
+    print(f"  image  {out}")
+    if record_path is not None:
+        print(f"  record {record_path} ({record_bytes} bytes)")
+    return EXIT_OK
+
+
 def _resolve_mode_params(args, target):
     params = {}
     if target is not None:
@@ -1250,6 +1802,49 @@ def main(argv=None) -> int:
     capture.add_argument("--gain", type=float, default=None)
     capture.add_argument("--out", default=None)
     capture.set_defaults(func=command_capture)
+
+    watch = sub.add_parser(
+        "watch", help="fold a live stream as it arrives")
+    common(watch)
+    watch.add_argument("--target", type=int, default=None)
+    watch.add_argument("--freq", default=None)
+    watch.add_argument("--mode", choices=sorted(MODE_BY_NAME),
+                       default=None)
+    watch.add_argument("--width", type=int, default=None)
+    watch.add_argument("--height", type=int, default=None)
+    watch.add_argument("--htotal", type=int, default=None)
+    watch.add_argument("--vtotal", type=int, default=None)
+    watch.add_argument("--refresh", type=float, default=None)
+    watch.add_argument("--pixel-clock", type=float, default=None)
+    watch.add_argument("--rate", type=int, default=2_400_000)
+    watch.add_argument("--gain", type=float, default=None)
+    watch.add_argument("--source", default=None,
+                       help="replay this IQ file (.cu8 or .cf32) "
+                            "as a stream instead of using the tuner")
+    watch.add_argument("--seconds", type=float, default=None,
+                       help="stop after this many seconds of signal "
+                            "(default: until the stream ends or "
+                            "Ctrl+C)")
+    watch.add_argument("--out", default=None,
+                       help="live image path (default "
+                            "<session>/watch.png), rewritten in place")
+    watch.add_argument("--interval", type=float, default=1.0,
+                       help="minimum seconds between snapshot writes")
+    watch.add_argument("--every-frames", type=int, default=30,
+                       help="also write a snapshot every N folded "
+                            "frames")
+    watch.add_argument("--chunk-seconds", type=float, default=0.25,
+                       help="stream block size, in seconds of signal")
+    watch.add_argument("--no-record", action="store_true",
+                       help="do not record the raw stream while "
+                            "watching")
+    watch.add_argument("--record-out", default=None,
+                       help="recording path (default "
+                            "<session>/watch-<time>.<fmt>)")
+    watch.add_argument("--reference", default=None,
+                       help="reference PNG to score each snapshot "
+                            "against")
+    watch.set_defaults(func=command_watch)
 
     recon = sub.add_parser("reconstruct", help="fold IQ into an image")
     common(recon)
