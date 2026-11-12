@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover - exercised only without numpy
     np = None
     HAS_NUMPY = False
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 2
@@ -87,12 +87,97 @@ MODES = [
     {"name": "1920x1080@60", "width": 1920, "height": 1080,
      "htotal": 2200, "vtotal": 1125, "pixel_clock": 148_500_000,
      "refresh": 60.0},
+    {"name": "1024x600@60", "width": 1024, "height": 600,
+     "htotal": 1344, "vtotal": 635, "pixel_clock": 51_420_000,
+     "refresh": 60.25},
+    {"name": "1280x800@60", "width": 1280, "height": 800,
+     "htotal": 1680, "vtotal": 831, "pixel_clock": 83_500_000,
+     "refresh": 59.81},
+    {"name": "1366x768@60", "width": 1366, "height": 768,
+     "htotal": 1792, "vtotal": 795, "pixel_clock": 85_500_000,
+     "refresh": 60.02},
+    {"name": "1440x900@60", "width": 1440, "height": 900,
+     "htotal": 1904, "vtotal": 934, "pixel_clock": 106_500_000,
+     "refresh": 59.89},
+    {"name": "1600x900@60", "width": 1600, "height": 900,
+     "htotal": 1800, "vtotal": 1000, "pixel_clock": 108_000_000,
+     "refresh": 60.0},
+    {"name": "1680x1050@60", "width": 1680, "height": 1050,
+     "htotal": 2240, "vtotal": 1089, "pixel_clock": 146_250_000,
+     "refresh": 59.95},
+    {"name": "1920x1200@60", "width": 1920, "height": 1200,
+     "htotal": 2080, "vtotal": 1235, "pixel_clock": 154_000_000,
+     "refresh": 59.95},
     {"name": "SIM320x200@60", "width": 320, "height": 200,
      "htotal": 400, "vtotal": 240, "pixel_clock": 5_760_000,
      "refresh": 60.0},
 ]
 
 MODE_BY_NAME = {m["name"]: m for m in MODES}
+
+# ---------------------------------------------------------------------
+# Well-known spectrum occupants. A strong peak is not necessarily a
+# display: whole bands belong to transmitters that radiate on purpose.
+# When a target's strongest peak falls inside one of these
+# allocations, its census entry gains a plain note naming the usual
+# occupant. A note never removes or demotes a target - it informs
+# the operator's choice, nothing more.
+# ---------------------------------------------------------------------
+
+OCCUPANT_BANDS = [
+    (88_000_000, 108_000_000,
+     "FM broadcast band - the usual occupant is a broadcast radio "
+     "transmitter, not a display"),
+    (118_000_000, 137_000_000,
+     "airband - the usual occupants are aircraft and ground-station "
+     "voice transmitters, not displays"),
+    (144_000_000, 148_000_000,
+     "2 m amateur band - the usual occupant is an amateur radio "
+     "transmitter, not a display"),
+    (150_000_000, 162_000_000,
+     "VHF land mobile and paging band - the usual occupants are "
+     "land-mobile and paging transmitters, not displays"),
+    (162_400_000, 162_550_000,
+     "NOAA weather radio - the usual occupant is a weather "
+     "broadcast transmitter, not a display"),
+    (420_000_000, 450_000_000,
+     "70 cm amateur band - the usual occupant is an amateur radio "
+     "transmitter, not a display"),
+]
+
+
+def occupant_note(freq_hz):
+    """The spectrum note for a frequency, or None outside the
+    table."""
+    if freq_hz is None:
+        return None
+    for low, high, note in OCCUPANT_BANDS:
+        if low <= freq_hz <= high:
+            return note
+    return None
+
+
+# ---------------------------------------------------------------------
+# The lock floor. A fold only counts as a raster lock when the
+# frame-period autocorrelation peak reaches this strength. The
+# calibration is measured, not chosen for looks: a strong real
+# carrier with no raster structure in it scored 0.039 in the field,
+# while genuine locks on the simulator's signal score 0.59 and up.
+# Below the floor, watch and reconstruct print a plain no-lock
+# verdict instead of letting a noise image speak for itself.
+# ---------------------------------------------------------------------
+
+LOCK_FLOOR = 0.20
+
+
+def lock_verdict(autocorr_peak):
+    """The plain verdict line for a fold, or None when it locked."""
+    peak = autocorr_peak if autocorr_peak is not None else 0.0
+    if peak >= LOCK_FLOOR:
+        return None
+    return (f"verdict: no raster lock was found in this signal "
+            f"(autocorrelation peak {peak:.3f}, below the "
+            f"{LOCK_FLOOR:.2f} lock floor)")
 
 TUNER_PROGRAMS = (
     "rtl_sdr", "rtl_power", "rtl_fm", "rtl_433", "readsb",
@@ -355,6 +440,8 @@ def find_targets(freqs, db, modes=MODES, threshold_db=6.0,
             "harmonic_confirmed": confirmed,
             "weak": bool(weak), "ambiguous": bool(ambiguous),
             "notes": notes,
+            "occupant_note":
+                occupant_note(strongest["peak"]["freq_hz"]),
         })
 
     claimed_bins = set(claimed)
@@ -376,6 +463,7 @@ def find_targets(freqs, db, modes=MODES, threshold_db=6.0,
             "weak": bool(peak["over_floor_db"] < weak_db),
             "ambiguous": False,
             "notes": ["no pixel-clock family match"],
+            "occupant_note": occupant_note(peak["freq_hz"]),
         })
 
     targets.sort(key=lambda t: -t["strongest_over_floor_db"])
@@ -414,6 +502,8 @@ def format_target_list(targets):
                 f"{p['over_floor_db']:.1f} over floor{harm}")
         for note in t["notes"]:
             lines.append(f"      note: {note}")
+        if t.get("occupant_note"):
+            lines.append(f"      occupant: {t['occupant_note']}")
     return lines
 
 
@@ -1262,6 +1352,30 @@ def prompt_for_target(session, payload):
         print("no such target; try again")
 
 
+def describe_unidentified_target(target):
+    """What an unidentified target actually is, in one line: its
+    strongest frequency, its level over floor, and the fact that no
+    pixel-clock family matched it."""
+    return (f"target {target['number']} is unidentified: strongest "
+            f"{fmt_freq(target['strongest_freq_hz'])} at "
+            f"{target['strongest_over_floor_db']:.1f} dB over floor, "
+            f"and no pixel-clock family matched it, so it carries "
+            f"no display geometry")
+
+
+def unidentified_target_lines(target):
+    """The full explanation printed when a command needs geometry
+    an unidentified target cannot supply: what the target is, and
+    the two ways forward."""
+    return [
+        describe_unidentified_target(target),
+        "  two ways forward: choose a target with a mode from the "
+        "hunt list, or",
+        "  pass --mode NAME, or --width and --height, if you know "
+        "the source's geometry",
+    ]
+
+
 def target_mode_params(target):
     if target is None or target.get("mode_guess") is None:
         return None
@@ -1385,6 +1499,14 @@ def command_capture(args) -> int:
         print("capture needs a target (--target N) or a frequency "
               "(--freq); run hunt first", file=sys.stderr)
         return EXIT_UNAVAILABLE
+    if target is not None and target.get("mode_guess") is None:
+        # Recording needs no geometry, so capture proceeds - but
+        # say plainly what this target is, because folding the
+        # recording later will need a geometry from somewhere.
+        print(f"note: {describe_unidentified_target(target)}; "
+              f"recording it needs no geometry, but watch and "
+              f"reconstruct will ask for --mode or --width and "
+              f"--height")
     plan = plan_capture(target=target,
                         freq=parse_freq(args.freq) if args.freq
                         else None,
@@ -1446,8 +1568,12 @@ def command_watch(args) -> int:
         return EXIT_UNAVAILABLE
     params = _resolve_mode_params(args, target)
     if "width" not in params or "height" not in params:
-        print("watch needs a mode: --target N, --mode NAME, or "
-              "--width and --height", file=sys.stderr)
+        if target is not None and target.get("mode_guess") is None:
+            for line in unidentified_target_lines(target):
+                print(line, file=sys.stderr)
+        else:
+            print("watch needs a mode: --target N, --mode NAME, or "
+                  "--width and --height", file=sys.stderr)
         return EXIT_UNAVAILABLE
     plan = {
         "freq_hz": int(target["strongest_freq_hz"]) if target
@@ -1623,6 +1749,9 @@ def command_watch(args) -> int:
     }
     if "reference_ncc" in stats:
         summary["reference_ncc"] = stats["reference_ncc"]
+    verdict = lock_verdict(summary["autocorr_peak"])
+    if verdict is not None:
+        summary["verdict"] = "no_lock"
     session.log("watch", **plan, **summary)
     if stats["frames_folded"] < 1:
         print("watch: no sync acquired - no frame was folded, and "
@@ -1641,6 +1770,8 @@ def command_watch(args) -> int:
     print(f"  image  {out}")
     if record_path is not None:
         print(f"  record {record_path} ({record_bytes} bytes)")
+    if verdict is not None:
+        print(verdict)
     return EXIT_OK
 
 
@@ -1684,8 +1815,12 @@ def command_reconstruct(args) -> int:
         return err
     params = _resolve_mode_params(args, target)
     if "width" not in params or "height" not in params:
-        print("reconstruct needs a mode: --target N, --mode NAME, or "
-              "--width and --height", file=sys.stderr)
+        if target is not None and target.get("mode_guess") is None:
+            for line in unidentified_target_lines(target):
+                print(line, file=sys.stderr)
+        else:
+            print("reconstruct needs a mode: --target N, --mode NAME, "
+                  "or --width and --height", file=sys.stderr)
         return EXIT_UNAVAILABLE
     iq_path = Path(args.iq)
     if not iq_path.is_file():
@@ -1707,6 +1842,9 @@ def command_reconstruct(args) -> int:
             [reference.astype(np.uint8), gap, image], axis=1)
         side_by_side = out.with_name(out.stem + "-side-by-side.png")
         write_png(side_by_side, combined)
+    verdict = lock_verdict(report["autocorr_peak"])
+    if verdict is not None:
+        report["verdict"] = "no_lock"
     session.log("reconstruct", iq=str(iq_path), out=str(out),
                 target_number=target["number"] if target else None,
                 **report)
@@ -1732,6 +1870,8 @@ def command_reconstruct(args) -> int:
     print(f"  image       {out}")
     if side_by_side:
         print(f"  side-by-side {side_by_side}")
+    if verdict is not None:
+        print(f"  {verdict}")
     return EXIT_OK
 
 

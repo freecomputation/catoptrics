@@ -3,6 +3,8 @@
 Run: python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -494,6 +496,204 @@ class TestWatchCommand(unittest.TestCase):
                                  "--freq", "121.5M",
                                  "--mode", "SIM320x200@60"])
             self.assertEqual(code, cat.EXIT_UNAVAILABLE)
+
+
+# ---------------------------------------------------------------------
+# 0.2.1: the field lessons - occupant notes, the widened mode table,
+# actionable refusals, and the plain no-lock verdict
+# ---------------------------------------------------------------------
+
+class TestOccupantNotes(unittest.TestCase):
+    def test_note_attaches_to_fm_and_noaa_peaks(self):
+        self.assertIn("FM broadcast", cat.occupant_note(98.5e6))
+        self.assertIn("NOAA weather radio",
+                      cat.occupant_note(162.5e6))
+        self.assertIn("land mobile", cat.occupant_note(153.546e6))
+        freqs, db = synthetic_spectrum([(98.5e6, 24.0)])
+        t = cat.find_targets(freqs, db)[0]
+        self.assertIn("FM broadcast", t["occupant_note"])
+        lines = cat.format_target_list([t])
+        self.assertTrue(any("occupant:" in line and "FM broadcast"
+                            in line for line in lines))
+        freqs, db = synthetic_spectrum([(162.5e6, 22.0)])
+        t = cat.find_targets(freqs, db)[0]
+        self.assertIn("NOAA weather radio", t["occupant_note"])
+
+    def test_no_note_outside_the_table(self):
+        self.assertIsNone(cat.occupant_note(33.3e6))
+        self.assertIsNone(cat.occupant_note(300e6))
+        self.assertIsNone(cat.occupant_note(None))
+        freqs, db = synthetic_spectrum([(33.3e6, 20.0)])
+        t = cat.find_targets(freqs, db)[0]
+        self.assertIsNone(t["occupant_note"])
+
+
+class TestWidenedModes(unittest.TestCase):
+    def test_1280x800_family_is_claimed(self):
+        bumps = [(83.5e6, 20.0), (167.0e6, 17.0), (250.5e6, 14.0)]
+        freqs, db = synthetic_spectrum(bumps)
+        targets = cat.find_targets(freqs, db)
+        self.assertEqual(len(targets), 1)
+        t = targets[0]
+        self.assertEqual(t["kind"], "mode")
+        self.assertEqual(t["mode_guess"], "1280x800@60")
+        self.assertTrue(t["harmonic_confirmed"])
+        self.assertEqual(t["width"], 1280)
+        self.assertEqual(t["height"], 800)
+
+    def test_new_modes_are_selectable(self):
+        for name in ("1280x800@60", "1366x768@60", "1440x900@60",
+                     "1600x900@60", "1680x1050@60", "1920x1200@60",
+                     "1024x600@60"):
+            self.assertIn(name, cat.MODE_BY_NAME)
+            mode = cat.MODE_BY_NAME[name]
+            implied = (mode["htotal"] * mode["vtotal"]
+                       * mode["refresh"])
+            self.assertAlmostEqual(implied / mode["pixel_clock"],
+                                   1.0, delta=0.01)
+
+
+class TestUnidentifiedRefusal(unittest.TestCase):
+    def _session_with_unidentified(self, td):
+        session = cat.Session(td)
+        freqs, db = synthetic_spectrum([(33.3e6, 20.0)])
+        targets = cat.find_targets(freqs, db)
+        self.assertEqual(targets[0]["kind"], "unidentified")
+        session.save_targets(targets, {"source": "test"})
+        return session
+
+    def test_watch_refusal_names_the_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._session_with_unidentified(td)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = cat.main(["watch", "--session", td,
+                                 "--target", "1"])
+            self.assertEqual(code, cat.EXIT_UNAVAILABLE)
+            text = err.getvalue()
+            self.assertIn("33.300 MHz", text)
+            self.assertIn("no pixel-clock family matched it", text)
+            self.assertIn("choose a target with a mode", text)
+            self.assertIn("--mode NAME", text)
+            self.assertIn("--width and --height", text)
+
+    def test_reconstruct_refusal_names_the_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._session_with_unidentified(td)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = cat.main(["reconstruct", "--session", td,
+                                 "--iq", str(Path(td) / "x.cf32"),
+                                 "--target", "1"])
+            self.assertEqual(code, cat.EXIT_UNAVAILABLE)
+            text = err.getvalue()
+            self.assertIn("33.300 MHz", text)
+            self.assertIn("no pixel-clock family matched it", text)
+            self.assertIn("--mode NAME", text)
+
+
+def _noise_iq(seconds=0.3, rate=11_520_000, seed=7):
+    """A carrier-like signal: complex white noise, no raster
+    structure anywhere in it."""
+    rng = np.random.default_rng(seed)
+    n = int(rate * seconds)
+    return (rng.standard_normal(n)
+            + 1j * rng.standard_normal(n)).astype(np.complex64)
+
+
+class TestNoLockVerdict(unittest.TestCase):
+    def test_carrier_fold_ends_with_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            iq_path = Path(td) / "carrier.cf32"
+            cat.save_iq(iq_path, _noise_iq(), "cf32")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cat.main(["reconstruct", "--session", td,
+                                 "--iq", str(iq_path),
+                                 "--mode", "SIM320x200@60",
+                                 "--rate", "11520000"])
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertIn("no raster lock was found in this signal",
+                          out.getvalue())
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            recon = [e for e in entries
+                     if e["event"] == "reconstruct"][0]
+            self.assertEqual(recon["verdict"], "no_lock")
+            self.assertLess(recon["autocorr_peak"], cat.LOCK_FLOOR)
+
+    def test_genuine_raster_gets_no_verdict(self):
+        mode = cat.MODE_BY_NAME["SIM320x200@60"]
+        iq, info, pattern = cat.simulate_iq(mode)
+        with tempfile.TemporaryDirectory() as td:
+            iq_path = Path(td) / "sim.cf32"
+            cat.save_iq(iq_path, iq, "cf32")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cat.main(["reconstruct", "--session", td,
+                                 "--iq", str(iq_path),
+                                 "--mode", "SIM320x200@60",
+                                 "--rate", str(info["rate"])])
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertNotIn("no raster lock", out.getvalue())
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            recon = [e for e in entries
+                     if e["event"] == "reconstruct"][0]
+            self.assertNotIn("verdict", recon)
+            self.assertGreaterEqual(recon["autocorr_peak"],
+                                    cat.LOCK_FLOOR)
+
+    def test_watch_on_carrier_ends_with_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            iq_path = Path(td) / "carrier.cf32"
+            cat.save_iq(iq_path, _noise_iq(), "cf32")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cat.main(["watch", "--session", td,
+                                 "--source", str(iq_path),
+                                 "--mode", "SIM320x200@60",
+                                 "--rate", "11520000",
+                                 "--seconds", "0.3", "--no-record"])
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertIn("no raster lock was found in this signal",
+                          out.getvalue())
+
+
+class TestFieldMirrorCensus(unittest.TestCase):
+    """The first field hunt, rebuilt synthetically: strong FM
+    peaks, a strong lone 153.5 MHz peak, a NOAA-frequency peak, and
+    one true 1280x800 family. The census output must read the way
+    it should have read on the porch."""
+
+    BUMPS = [(89.906e6, 26.0), (105.712e6, 28.0),
+             (153.546e6, 25.9), (162.550e6, 18.0),
+             (83.5e6, 20.0), (167.0e6, 17.0), (250.5e6, 14.0)]
+
+    def test_mirror_census(self):
+        freqs, db = synthetic_spectrum(self.BUMPS)
+        targets = cat.find_targets(freqs, db)
+
+        def nearest(freq):
+            t = min(targets, key=lambda t: abs(
+                t["strongest_freq_hz"] - freq))
+            self.assertLess(abs(t["strongest_freq_hz"] - freq),
+                            100_000)
+            return t
+
+        fm = nearest(105.712e6)
+        self.assertIn("FM broadcast", fm["occupant_note"])
+        lone = nearest(153.546e6)
+        self.assertIn("land mobile", lone["occupant_note"])
+        noaa = nearest(162.550e6)
+        self.assertIn("NOAA weather radio", noaa["occupant_note"])
+        wxga = nearest(83.5e6)
+        self.assertEqual(wxga["kind"], "mode")
+        self.assertEqual(wxga["mode_guess"], "1280x800@60")
+        self.assertTrue(wxga["harmonic_confirmed"])
+        lines = cat.format_target_list(targets)
+        self.assertTrue(any("occupant:" in line for line in lines))
+        self.assertTrue(any("1280x800@60" in line for line in lines))
 
 
 if __name__ == "__main__":
