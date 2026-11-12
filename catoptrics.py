@@ -15,6 +15,9 @@ The workflow is a census and a selection:
     watch       the live bench: fold frames from a stream as they
                 arrive, writing a picture that sharpens while you
                 look at it, and recording the raw IQ as it goes
+    survey      one unattended pass over the census: capture each
+                target that carries a mode and fold it into an
+                image file, with a written summary of the walk
     reconstruct fold a capture back into a raster image, with a
                 written report of sync quality and image SNR
     simulate    synthesize a raster emanation from a built-in test
@@ -36,6 +39,7 @@ Usage:
     python3 catoptrics.py hunt --low 40M --high 400M
     python3 catoptrics.py capture --target 2 --seconds 5
     python3 catoptrics.py watch --target 2
+    python3 catoptrics.py survey
     python3 catoptrics.py reconstruct --iq capture.cu8 --target 2
     python3 catoptrics.py simulate --out sim.iq
 """
@@ -61,7 +65,7 @@ except ImportError:  # pragma: no cover - exercised only without numpy
     np = None
     HAS_NUMPY = False
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 2
@@ -983,6 +987,39 @@ def normalized_cross_correlation(a, b):
     return float((x * y).sum() / denom)
 
 
+def make_contact_sheet(images, cell_width=320, cell_height=200,
+                       gap=4):
+    """Assemble images into one plain grid, at the array level.
+
+    Each image is scaled down (never up) to fit its cell by
+    nearest-neighbour sampling and set into the grid in order; the
+    cells are separated by a narrow dark gap. No text is drawn -
+    which cell holds which target is the summary's business, not
+    the picture's.
+    """
+    n = len(images)
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+    canvas = np.zeros(
+        (rows * cell_height + (rows + 1) * gap,
+         cols * cell_width + (cols + 1) * gap), dtype=np.uint8)
+    for i, img in enumerate(images):
+        img = np.asarray(img, dtype=np.uint8)
+        scale = min(cell_width / img.shape[1],
+                    cell_height / img.shape[0], 1.0)
+        if scale < 1.0:
+            new_w = max(1, int(img.shape[1] * scale))
+            new_h = max(1, int(img.shape[0] * scale))
+            ys = (np.arange(new_h) / scale).astype(int)
+            xs = (np.arange(new_w) / scale).astype(int)
+            img = img[np.ix_(ys, xs)]
+        r, c = divmod(i, cols)
+        y0 = gap + r * (cell_height + gap)
+        x0 = gap + c * (cell_width + gap)
+        canvas[y0:y0 + img.shape[0], x0:x0 + img.shape[1]] = img
+    return canvas
+
+
 def reconstruct_iq(iq, rate, mode_params, reference=None):
     """Run the bench on loaded IQ.
 
@@ -1400,6 +1437,30 @@ def plan_capture(target=None, freq=None, rate=2_400_000, seconds=5.0,
     }
 
 
+def capture_iq_file(plan, out_path):
+    """Run rtl_sdr for a planned capture into out_path.
+
+    Returns None on success, or the error text on failure. This is
+    the one place the survey runs a capture subprocess, kept as a
+    module-level seam so a test can back a target with synthesized
+    IQ instead of hardware - the same way the suite stubs the
+    tuner-holder scan - while normal operation always talks to the
+    real receiver.
+    """
+    cmd = ["rtl_sdr", "-f", str(plan["freq_hz"]), "-s",
+           str(plan["rate"]), "-n", str(plan["samples"])]
+    if plan.get("gain") is not None:
+        cmd += ["-g", str(plan["gain"])]
+    cmd += [str(out_path)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        return (exc.stderr or "").strip() or "rtl_sdr failed"
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 # ---------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------
@@ -1775,6 +1836,268 @@ def command_watch(args) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------
+# The survey: one unattended pass over the census. It does what
+# hunt, capture and reconstruct do by hand - census the band, then
+# walk the target list in order, capturing and folding every target
+# that carries a mode into an image file, and writing a summary of
+# the whole walk. A target without geometry is never folded: it is
+# listed in the summary and that is all. Inventing a picture for it
+# would be a lie with a file extension.
+# ---------------------------------------------------------------------
+
+def _survey_stem(target):
+    """The file stem a surveyed target's IQ and image share: the
+    target number, its visible raster, its strongest frequency."""
+    freq = f"{target['strongest_freq_hz'] / 1e6:.3f}MHz"
+    if target["kind"] == "mode":
+        raster = f"{target['width']}x{target['height']}"
+    else:
+        raster = "unidentified"
+    return f"target-{target['number']:02d}-{raster}-{freq}"
+
+
+def _survey_lines(doc):
+    """The plain-text rendering of a survey: a counts line, one
+    line per target processed, and the contact-sheet and stop
+    notes. The same text is written to survey.txt and printed."""
+    counts = doc["counts"]
+    lines = [
+        f"survey: {counts['targets']} targets processed - "
+        f"{counts['locked']} locked, {counts['no_lock']} no raster "
+        f"lock, {counts['listed']} listed only, "
+        f"{counts['skipped']} skipped, {counts['failed']} failed",
+    ]
+    for e in doc["targets"]:
+        head = f"#{e['number']}"
+        freq = fmt_freq(e["strongest_freq_hz"])
+        if e["status"] == "listed":
+            line = (f"{head} unidentified {freq} - listed only, "
+                    f"never folded (no display geometry)")
+            if e.get("occupant_note"):
+                line += f"; occupant: {e['occupant_note']}"
+        elif e["status"] == "skipped":
+            line = (f"{head} {e['mode']} {freq} - skipped "
+                    f"({e['reason']})")
+        elif e["status"] == "failed":
+            line = (f"{head} {e['mode']} {freq} - capture failed "
+                    f"({e['reason']})")
+        else:
+            verdict = "locked" if e["status"] == "locked" \
+                else "no raster lock"
+            line = (f"{head} {e['mode']} {freq} - capture "
+                    f"{e['capture_seconds']:.1f} s, autocorrelation "
+                    f"peak {e['autocorr_peak']:.3f}, image SNR "
+                    f"{e['image_snr_db']:.1f} dB, {verdict}, "
+                    f"{e['image']}")
+        lines.append(line)
+    if doc["contact_sheet"]:
+        lines.append(
+            f"contact sheet: {doc['contact_sheet']} "
+            f"({counts['locked']} locked "
+            f"{'image' if counts['locked'] == 1 else 'images'})")
+    if doc["interrupted"]:
+        lines.append("survey interrupted before the walk finished; "
+                     "the targets above are what completed")
+    if doc["stopped_busy"]:
+        lines.append("survey stopped: the tuner was taken by "
+                     "another program; the targets above are what "
+                     "completed")
+    return lines
+
+
+def command_survey(args) -> int:
+    if not HAS_NUMPY:
+        print("survey unavailable: numpy is not installed",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    session = Session(args.session)
+    survey_dir = session.root / "survey"
+    started = now_iso()
+
+    # Tuner law, at the start as everywhere: a holder means
+    # refusal, with the holder named - never a kill, never a
+    # preemption.
+    holders = refuse_if_busy(session, "survey")
+    if holders:
+        print_busy(holders)
+        return EXIT_BUSY
+
+    # The census: reuse the last hunt's list, census a spectrum
+    # file, or sweep. The target list is the survey's marching
+    # orders.
+    if args.no_hunt:
+        payload = session.load_targets()
+        if not payload or not payload.get("targets"):
+            print("survey has no target list to reuse: run hunt "
+                  "first, or drop --no-hunt", file=sys.stderr)
+            return EXIT_UNAVAILABLE
+    else:
+        hunt_args = argparse.Namespace(
+            session=args.session, low=args.low, high=args.high,
+            bin_hz=25_000, seconds=20, gain=args.gain,
+            threshold=args.threshold, spectrum=args.spectrum)
+        code = command_hunt(hunt_args)
+        if code != EXIT_OK:
+            return code
+        payload = session.load_targets()
+    targets = payload.get("targets", [])
+    mode_targets = [t for t in targets if t["kind"] == "mode"]
+
+    if mode_targets and shutil.which("rtl_sdr") is None:
+        print("survey unavailable: rtl_sdr not found",
+              file=sys.stderr)
+        session.log("survey_unavailable", reason="rtl_sdr missing")
+        return EXIT_UNAVAILABLE
+
+    # The walk is written down before the tuner is touched, as
+    # with capture.
+    session.log("survey_planned",
+                targets=[t["number"] for t in targets],
+                mode_targets=[t["number"] for t in mode_targets],
+                seconds=args.seconds, rate=args.rate,
+                limit=args.limit,
+                confirmed_only=args.confirmed_only,
+                no_hunt=args.no_hunt, spectrum=args.spectrum)
+    survey_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    locked_images = []
+    captures_done = 0
+    stopped_busy = False
+    interrupted = False
+
+    def base_entry(t):
+        return {
+            "number": t["number"], "kind": t["kind"],
+            "mode": t["mode_guess"],
+            "strongest_freq_hz": t["strongest_freq_hz"],
+            "strongest_over_floor_db":
+                t["strongest_over_floor_db"],
+            "harmonic_confirmed": t["harmonic_confirmed"],
+            "weak": t["weak"],
+            "occupant_note": t.get("occupant_note"),
+            "status": None, "reason": None, "verdict": None,
+            "capture_seconds": None, "autocorr_peak": None,
+            "image_snr_db": None, "frames_averaged": None,
+            "image": None, "iq": None,
+        }
+
+    def finish(entry):
+        results.append(entry)
+        session.log("survey_target", **entry)
+
+    try:
+        for t in targets:
+            entry = base_entry(t)
+            if t["kind"] != "mode":
+                entry["status"] = "listed"
+                finish(entry)
+                continue
+            if args.confirmed_only and not t["harmonic_confirmed"]:
+                entry["status"] = "skipped"
+                entry["reason"] = ("no second-harmonic confirmation "
+                                   "(--confirmed-only)")
+                finish(entry)
+                continue
+            if args.limit is not None \
+                    and captures_done >= args.limit:
+                entry["status"] = "skipped"
+                entry["reason"] = f"--limit {args.limit} reached"
+                finish(entry)
+                continue
+            # The holder scan runs again before every capture. If
+            # the tuner was taken mid-survey, everything already
+            # finished stands and the survey stops here.
+            holders = refuse_if_busy(session, "survey")
+            if holders:
+                print_busy(holders)
+                stopped_busy = True
+                break
+            plan = plan_capture(target=t, rate=args.rate,
+                                seconds=args.seconds,
+                                gain=args.gain)
+            stem = _survey_stem(t)
+            iq_path = survey_dir / (stem + ".cu8")
+            print(f"survey: target {t['number']} "
+                  f"({t['mode_guess']}), "
+                  f"{fmt_freq(plan['freq_hz'])}, capturing "
+                  f"{args.seconds} s -> {iq_path.name}", flush=True)
+            error = capture_iq_file(plan, iq_path)
+            captures_done += 1
+            if error is not None:
+                entry["status"] = "failed"
+                entry["reason"] = error
+                session.log("survey_capture_failed",
+                            target_number=t["number"], error=error)
+                finish(entry)
+                continue
+            iq = load_iq(iq_path)
+            image, report = reconstruct_iq(
+                iq, args.rate, target_mode_params(t))
+            image_name = stem + ".png"
+            write_png(survey_dir / image_name, image)
+            entry["capture_seconds"] = float(args.seconds)
+            entry["autocorr_peak"] = report["autocorr_peak"]
+            entry["image_snr_db"] = report["image_snr_db"]
+            entry["frames_averaged"] = report["frames_averaged"]
+            entry["image"] = image_name
+            entry["iq"] = iq_path.name
+            if lock_verdict(report["autocorr_peak"]) is None:
+                entry["status"] = "locked"
+                entry["verdict"] = "locked"
+                locked_images.append(image)
+            else:
+                entry["status"] = "no_lock"
+                entry["verdict"] = "no_lock"
+            finish(entry)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nsurvey interrupted", flush=True)
+
+    counts = {
+        "targets": len(results),
+        "locked": sum(1 for e in results
+                      if e["status"] == "locked"),
+        "no_lock": sum(1 for e in results
+                       if e["status"] == "no_lock"),
+        "listed": sum(1 for e in results
+                      if e["status"] == "listed"),
+        "skipped": sum(1 for e in results
+                       if e["status"] == "skipped"),
+        "failed": sum(1 for e in results
+                      if e["status"] == "failed"),
+    }
+    contact_sheet = None
+    if locked_images:
+        write_png(survey_dir / "survey-contact-sheet.png",
+                  make_contact_sheet(locked_images))
+        contact_sheet = "survey-contact-sheet.png"
+    doc = {
+        "version": __version__,
+        "started": started, "finished": now_iso(),
+        "seconds_per_capture": args.seconds, "rate": args.rate,
+        "limit": args.limit,
+        "confirmed_only": args.confirmed_only,
+        "interrupted": interrupted, "stopped_busy": stopped_busy,
+        "counts": counts, "contact_sheet": contact_sheet,
+        "targets": results,
+    }
+    with open(survey_dir / "survey.json", "w",
+              encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=1, sort_keys=True)
+    text = "\n".join(_survey_lines(doc))
+    (survey_dir / "survey.txt").write_text(text + "\n",
+                                           encoding="utf-8")
+    print(text)
+    session.log("survey_done", **counts, interrupted=interrupted,
+                stopped_busy=stopped_busy,
+                contact_sheet=contact_sheet)
+    if stopped_busy:
+        return EXIT_BUSY
+    return EXIT_OK
+
+
 def _resolve_mode_params(args, target):
     params = {}
     if target is not None:
@@ -1985,6 +2308,34 @@ def main(argv=None) -> int:
                        help="reference PNG to score each snapshot "
                             "against")
     watch.set_defaults(func=command_watch)
+
+    survey = sub.add_parser(
+        "survey", help="one unattended pass: census, then capture "
+                       "and fold every mode target")
+    common(survey)
+    survey.add_argument("--low", default="40M")
+    survey.add_argument("--high", default="400M")
+    survey.add_argument("--threshold", type=float, default=6.0,
+                        help="dB over local floor a peak must reach")
+    survey.add_argument("--spectrum", default=None,
+                        help="census this spectrum file instead of "
+                             "sweeping")
+    survey.add_argument("--no-hunt", action="store_true",
+                        help="reuse the session's saved target list "
+                             "instead of censusing again")
+    survey.add_argument("--seconds", type=float, default=20.0,
+                        help="seconds of IQ captured per target "
+                             "(default 20)")
+    survey.add_argument("--limit", type=int, default=None,
+                        help="cap on how many targets are captured")
+    survey.add_argument("--rate", type=int, default=2_400_000)
+    survey.add_argument("--gain", type=float, default=None)
+    survey.add_argument("--confirmed-only", action="store_true",
+                        help="skip mode targets without "
+                             "second-harmonic confirmation (default "
+                             "surveys every mode target, weak ones "
+                             "included and labeled)")
+    survey.set_defaults(func=command_survey)
 
     recon = sub.add_parser("reconstruct", help="fold IQ into an image")
     common(recon)

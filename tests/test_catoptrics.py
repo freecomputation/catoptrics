@@ -696,5 +696,232 @@ class TestFieldMirrorCensus(unittest.TestCase):
         self.assertTrue(any("1280x800@60" in line for line in lines))
 
 
+# ---------------------------------------------------------------------
+# 0.3.0: the survey - one unattended pass over the census. Captures
+# are backed through the capture_iq_file seam, the same way the
+# suite stubs the tuner-holder scan everywhere else.
+# ---------------------------------------------------------------------
+
+SURVEY_WORLD_BUMPS = ([(5.76e6, 20.0), (11.52e6, 17.0),
+                       (17.28e6, 14.0)]      # SIM family, confirmed
+                      + [(65.0e6, 18.0)]     # XGA fundamental only:
+                                             # a mode target, weak
+                                             # and unconfirmed
+                      + [(33.3e6, 10.0)])    # no family: unidentified
+
+
+def _survey_session(td):
+    """Save a census of the survey world into a session."""
+    session = cat.Session(td)
+    freqs, db = synthetic_spectrum(SURVEY_WORLD_BUMPS)
+    targets = cat.find_targets(freqs, db)
+    by_mode = {t["mode_guess"]: t for t in targets}
+    assert by_mode["SIM320x200@60"]["harmonic_confirmed"]
+    assert not by_mode["1024x768@60"]["harmonic_confirmed"]
+    assert any(t["kind"] == "unidentified" for t in targets)
+    session.save_targets(targets, {"source": "test"})
+    return targets
+
+
+def _fake_survey_capture(record):
+    """A capture_iq_file stand-in: SIM targets are backed by the
+    simulator's raster IQ, everything else by carrier-like noise
+    with no raster in it."""
+    def fake(plan, out_path):
+        record.append(plan["target_number"])
+        if plan["target_mode"] == "SIM320x200@60":
+            mode = cat.MODE_BY_NAME["SIM320x200@60"]
+            iq, _info, _pattern = cat.simulate_iq(mode)
+            cat.save_iq(out_path, iq * 0.5, "cu8")
+        else:
+            cat.save_iq(out_path,
+                        _noise_iq(seconds=0.35) * 0.1, "cu8")
+        return None
+    return fake
+
+
+def _run_survey(td, extra=(), holders=()):
+    record = []
+    with mock.patch.object(cat, "find_tuner_holders",
+                           return_value=list(holders)), \
+            mock.patch.object(cat.shutil, "which",
+                              return_value="/usr/bin/rtl_sdr"), \
+            mock.patch.object(cat, "capture_iq_file",
+                              _fake_survey_capture(record)):
+        code = cat.main(["survey", "--session", td, "--no-hunt",
+                         "--rate", "11520000", "--seconds", "1",
+                         *extra])
+    return code, record
+
+
+def _survey_doc(td):
+    return json.loads(
+        (Path(td) / "survey" / "survey.json").read_text())
+
+
+class TestSurvey(unittest.TestCase):
+    def test_end_to_end_survey(self):
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            code, record = _run_survey(td)
+            self.assertEqual(code, cat.EXIT_OK)
+            survey_dir = Path(td) / "survey"
+            doc = _survey_doc(td)
+            by_number = {e["number"]: e for e in doc["targets"]}
+            self.assertEqual(len(by_number), 3)
+            locked = by_number[1]
+            self.assertEqual(locked["mode"], "SIM320x200@60")
+            self.assertEqual(locked["status"], "locked")
+            self.assertGreaterEqual(locked["autocorr_peak"],
+                                    cat.LOCK_FLOOR)
+            carrier = by_number[2]
+            self.assertEqual(carrier["mode"], "1024x768@60")
+            self.assertEqual(carrier["status"], "no_lock")
+            self.assertLess(carrier["autocorr_peak"], cat.LOCK_FLOOR)
+            listed = by_number[3]
+            self.assertEqual(listed["kind"], "unidentified")
+            self.assertEqual(listed["status"], "listed")
+            self.assertIsNone(listed["image"])
+            # Two image files, one per mode target, and the
+            # recordings they came from beside them.
+            for entry in (locked, carrier):
+                self.assertTrue(
+                    (survey_dir / entry["image"]).is_file())
+                self.assertTrue(
+                    (survey_dir / entry["iq"]).is_file())
+            # The unidentified target was never captured or folded.
+            self.assertEqual(sorted(record), [1, 2])
+            self.assertEqual(
+                list(survey_dir.glob("target-03-*.png")), [])
+            # The locked image scores against the pattern it was
+            # synthesized from.
+            mode = cat.MODE_BY_NAME["SIM320x200@60"]
+            _iq, _info, pattern = cat.simulate_iq(mode)
+            image = cat.read_png(survey_dir / locked["image"])
+            ncc = cat.normalized_cross_correlation(
+                pattern * 255.0, image.astype(np.float64))
+            self.assertGreaterEqual(ncc, 0.9)
+            # Both summaries carry every target's line.
+            text = (survey_dir / "survey.txt").read_text()
+            self.assertIn("SIM320x200@60", text)
+            self.assertIn("locked", text)
+            self.assertIn("1024x768@60", text)
+            self.assertIn("no raster lock", text)
+            self.assertIn("unidentified", text)
+            self.assertIn("listed only", text)
+            self.assertEqual(doc["counts"]["locked"], 1)
+            self.assertEqual(doc["counts"]["no_lock"], 1)
+            self.assertEqual(doc["counts"]["listed"], 1)
+            # One target locked, so the contact sheet exists.
+            self.assertEqual(doc["contact_sheet"],
+                             "survey-contact-sheet.png")
+            self.assertTrue(
+                (survey_dir / "survey-contact-sheet.png").is_file())
+            # The session log carries the survey's events.
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            events = [e["event"] for e in entries]
+            self.assertIn("survey_planned", events)
+            self.assertEqual(events.count("survey_target"), 3)
+            self.assertIn("survey_done", events)
+            planned = [e for e in entries
+                       if e["event"] == "survey_planned"][0]
+            self.assertEqual(planned["mode_targets"], [1, 2])
+
+    def test_confirmed_only_skips_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            code, record = _run_survey(td, ["--confirmed-only"])
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertEqual(record, [1])
+            doc = _survey_doc(td)
+            by_number = {e["number"]: e for e in doc["targets"]}
+            self.assertEqual(by_number[1]["status"], "locked")
+            self.assertEqual(by_number[2]["status"], "skipped")
+            self.assertIn("second-harmonic",
+                          by_number[2]["reason"])
+            self.assertIsNone(by_number[2]["image"])
+            self.assertEqual(doc["counts"]["skipped"], 1)
+
+    def test_limit_caps_captures(self):
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            code, record = _run_survey(td, ["--limit", "1"])
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertEqual(record, [1])
+            doc = _survey_doc(td)
+            by_number = {e["number"]: e for e in doc["targets"]}
+            self.assertEqual(by_number[2]["status"], "skipped")
+            self.assertIn("--limit", by_number[2]["reason"])
+
+    def test_no_contact_sheet_when_nothing_locked(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = cat.Session(td)
+            freqs, db = synthetic_spectrum(
+                [(65.0e6, 18.0), (33.3e6, 10.0)])
+            session.save_targets(cat.find_targets(freqs, db),
+                                 {"source": "test"})
+            code, record = _run_survey(td)
+            self.assertEqual(code, cat.EXIT_OK)
+            self.assertEqual(record, [1])
+            doc = _survey_doc(td)
+            self.assertIsNone(doc["contact_sheet"])
+            self.assertFalse(
+                (Path(td) / "survey"
+                 / "survey-contact-sheet.png").exists())
+            by_number = {e["number"]: e for e in doc["targets"]}
+            self.assertEqual(by_number[1]["status"], "no_lock")
+            self.assertEqual(by_number[2]["status"], "listed")
+
+    def test_survey_refuses_when_tuner_held_at_start(self):
+        holders = [{"pid": 4242, "command": "python3 -m passband run",
+                    "program": "passband"}]
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            code, record = _run_survey(td, holders=holders)
+            self.assertEqual(code, cat.EXIT_BUSY)
+            self.assertEqual(record, [])
+            self.assertEqual(list(Path(td).glob("survey/*.png")), [])
+            self.assertFalse((Path(td) / "survey").exists())
+            entries = [json.loads(line) for line in
+                       open(Path(td) / "session.jsonl")]
+            self.assertIn("refused_busy",
+                          [e["event"] for e in entries])
+
+    def test_survey_stops_when_tuner_taken_mid_walk(self):
+        holders = [{"pid": 4242, "command": "python3 -m passband run",
+                    "program": "passband"}]
+        scans = [[], [], holders]
+        record = []
+        with tempfile.TemporaryDirectory() as td:
+            _survey_session(td)
+            with mock.patch.object(
+                    cat, "find_tuner_holders",
+                    side_effect=lambda: scans.pop(0)), \
+                    mock.patch.object(cat.shutil, "which",
+                                      return_value="/usr/bin/rtl_sdr"), \
+                    mock.patch.object(
+                        cat, "capture_iq_file",
+                        _fake_survey_capture(record)):
+                code = cat.main(["survey", "--session", td,
+                                 "--no-hunt", "--rate", "11520000",
+                                 "--seconds", "1"])
+            self.assertEqual(code, cat.EXIT_BUSY)
+            # Only the first target was captured, and its outputs
+            # survive intact.
+            self.assertEqual(record, [1])
+            doc = _survey_doc(td)
+            self.assertTrue(doc["stopped_busy"])
+            self.assertEqual(doc["counts"]["locked"], 1)
+            self.assertEqual(len(doc["targets"]), 1)
+            entry = doc["targets"][0]
+            self.assertEqual(entry["status"], "locked")
+            survey_dir = Path(td) / "survey"
+            self.assertTrue((survey_dir / entry["image"]).is_file())
+            text = (survey_dir / "survey.txt").read_text()
+            self.assertIn("SIM320x200@60", text)
+            self.assertIn("survey stopped", text)
+
+
 if __name__ == "__main__":
     unittest.main()
