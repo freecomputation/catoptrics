@@ -53,6 +53,16 @@ Hunt, read the list, select a target, then capture and reconstruct
   A peak that two families could claim (the second harmonic of
   1280x720 is the fundamental of 1920x1080) is counted once, and the
   sharing is printed as a note on the target that claimed it.
+  A strong peak is not necessarily a display, so the census also
+  carries a small table of well-known spectrum allocations - FM
+  broadcast (88-108 MHz), airband (118-137 MHz), the 2 m amateur
+  band (144-148 MHz), VHF land mobile and paging (150-162 MHz),
+  NOAA weather radio (162.400-162.550 MHz), and the 70 cm amateur
+  band (420-450 MHz). When a target's strongest peak falls inside
+  one, its entry gains a plain note naming the usual occupant and
+  stating that transmitters there are not displays. The note is
+  printed in the list and stored in `targets.json`; it never
+  removes or demotes a target.
 - `capture` records raw IQ from the receiver. It takes a target by
   number (`--target N`, from the last hunt) or asks for one: run in
   a terminal with no target named, it prints the list and reads the
@@ -96,6 +106,24 @@ Hunt, read the list, select a target, then capture and reconstruct
   the holder named, never a kill or a preemption; a missing
   `rtl_sdr` or numpy is exit code 2.
 
+Two refusals deserve stating plainly. Pointing `watch` or
+`reconstruct` at an unidentified target - a peak no pixel-clock
+family matched - without an explicit geometry refuses with an
+explanation, not a bare error: the target's strongest frequency and
+level, the fact that no family matched it, and the two ways forward
+(choose a target with a mode, or pass `--mode` / `--width` and
+`--height` when the source's geometry is known). `capture` of an
+unidentified target proceeds - recording needs no geometry - with
+the same explanation printed as a note. And a fold is only called
+a lock when it earned it: when a `watch` or `reconstruct` finishes
+with a frame-period autocorrelation peak below the lock floor of
+0.20, it ends with a plain verdict line - "no raster lock was found
+in this signal" - alongside the numbers, and the verdict is
+recorded in the session log. The floor is calibrated on measured
+signals: a strong real carrier with no raster structure in it
+scored 0.039, while genuine locks on the simulator's signal score
+0.59 and up.
+
 Every hunt, capture, reconstruction, and watch is recorded in an
 append-only session log (`session.jsonl` in the session directory)
 with its parameters and its measured quality numbers.
@@ -130,8 +158,10 @@ python3 catoptrics.py watch --source sim.cf32 \
   frequency, plus `--rate`, `--seconds`, and `--gain`. Exit code 3
   means the tuner is held by another program, which is named; exit
   code 2 means a required tool is unavailable.
-- `reconstruct` accepts `--mode` (640x480@60, 1024x768@60,
-  1280x720@60, 1920x1080@60, or the simulator's SIM320x200@60) or
+- `reconstruct` accepts `--mode` (640x480@60, 1024x600@60,
+  1024x768@60, 1280x720@60, 1280x800@60, 1366x768@60, 1440x900@60,
+  1600x900@60, 1680x1050@60, 1920x1080@60, 1920x1200@60, or the
+  simulator's SIM320x200@60) or
   explicit `--width/--height/--htotal/--vtotal/--refresh/
   --pixel-clock`. `--reference PNG` scores the result against a
   known pattern with a normalized cross-correlation and writes a
@@ -190,7 +220,7 @@ python3 catoptrics.py watch --source sim.cf32 \
 
 ## Verification
 
-The test suite (`python3 -m unittest discover -s tests`, 26 tests)
+The test suite (`python3 -m unittest discover -s tests`, 36 tests)
 covers the pattern and codecs, the simulator's ground truth, sync
 estimation landing on the true frame period, reconstruction
 recovering the test pattern, the census grouping two synthetic
@@ -205,7 +235,18 @@ test, stable tracking across the planted +37 ppm clock offset with
 no re-lock, a re-lock adopted after a mid-stream clock jump to
 -800 ppm with the tracked period landing on the new clock, the
 recorded stream re-folding offline to the same picture, and the
-tuner-busy and unavailable refusals on the watch path.
+tuner-busy and unavailable refusals on the watch path. The 0.2.1
+tests add the field lessons: the occupant note attaching to
+synthetic FM-band and NOAA-frequency peaks and to nothing outside
+the table, a synthetic 1280x800 harmonic family claimed as that
+mode, the unidentified-target refusal carrying the frequency and
+both ways forward, a carrier-like signal with no raster structure
+ending in the no-lock verdict (on both the reconstruct and watch
+paths) while a genuine simulated raster earns none, and a
+synthetic mirror of the first field hunt - strong FM peaks, a
+strong lone 153.5 MHz peak, a NOAA-frequency peak, one true
+1280x800 family - censused with the notes and the mode claim
+reading as they should.
 
 The captured 0.2.0 watch proof replays the simulator's emanation as
 a stream (no tuner). At the standard point - SIM320x200@60, 12 dB
@@ -226,6 +267,12 @@ peak of 0.916. Hardware verification against a live display is
 pending a free tuner and will be recorded here when it happens.
 
 ## State
+
+0.2.1 - the field lessons. Spectrum occupant notes on census
+entries, seven more mode families in the table (1024x600, 1280x800,
+1366x768, 1440x900, 1600x900, 1680x1050, 1920x1200), actionable
+refusals for unidentified targets, and the plain no-lock verdict
+below an autocorrelation floor of 0.20.
 
 0.2.0 - the live bench. The `watch` command: incremental folding
 from a live or replayed stream, a live PNG with running statistics,
