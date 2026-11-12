@@ -35,16 +35,32 @@ much of a screen's image actually leaves the room, and in what shape?
   the reconstruction bench, and its output is always labelled as
   simulated.
 
-## What it does
+## How it is used
 
-- `hunt` sweeps a band and ranks candidate emanation frequencies:
-  measured peaks scored against their local noise floor, annotated
-  when a peak sits near a harmonic of a known display pixel clock.
-- `capture` records raw IQ from the receiver, with its parameters
-  written into the session log before the first sample is taken.
+Hunt, read the list, select a target, capture, reconstruct.
+
+- `hunt` sweeps a band and takes a census. Peaks that belong to one
+  source - one pixel-clock harmonic family with a consistent refresh
+  cadence - are grouped into a single target. The result is a
+  numbered target list, strongest first, persisted as `targets.json`
+  in the session directory. Each entry shows its evidence: the mode
+  it matches, its strongest frequency and measured level over the
+  local floor, its estimated refresh, and whether a second harmonic
+  confirms the family. A "target" is a distinct emanation source
+  cluster as measured - no more than that claim - and weak or
+  ambiguous clusters are marked as such, not presented as certain.
+- `capture` records raw IQ from the receiver. It takes a target by
+  number (`--target N`, from the last hunt) or asks for one: run in
+  a terminal with no target named, it prints the list and reads the
+  operator's choice. Selecting a target locks the capture frequency
+  and the expected mode - pixel clock, resolution, refresh - to that
+  target's measured parameters, and the session log records which
+  target was selected.
 - `reconstruct` is the bench: envelope detection, frame-sync
   refinement by autocorrelation, folding into a raster, averaging
-  across frames, and a written report of sync quality and image SNR.
+  across frames, and a written report of sync quality and image
+  SNR. It accepts the same `--target N`, which supplies the mode
+  parameters the target was measured with.
 - `simulate` synthesizes a raster emanation from a built-in test
   pattern, so the bench can be proven end to end without hardware.
 
